@@ -1,0 +1,24 @@
+<launch>
+<param name="/use_sim_time" value="true"/>
+
+  <!-- Play in quiet mode so roslaunch output stays readable -->
+  <node pkg="rosbag"
+        type="play"
+        name="bag_player"
+        output="screen"
+        args="/home/salahuddin/cornell/IR/IR-VO/rosbags/kitti/kitti_00.bag --clock -q"/>
+
+
+  <node pkg="ir_vo" type="mono_vo_node.py" name="mono_vo" output="screen">
+    <remap from="/camera/image_raw"     to="/kitti_stereo/left/image_rect"/>
+    <remap from="/camera/camera_info"   to="/kitti_stereo/left/camera_info"/>
+    <param name="detector" value="orb"/>
+  </node>
+
+  <node pkg="rviz"
+        type="rviz"
+        name="rviz"
+        required="true"
+        args="-d $(find ir_vo)/viz/kitti.rviz"/>
+
+</launch>

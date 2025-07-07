@@ -8,7 +8,7 @@ project(ir_vo)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
-  rospy
+  rospy sensor_msgs cv_bridge message_filters
 )
 
 ## System dependencies are found with CMake's conventions
@@ -151,6 +151,12 @@ include_directories(
 #############
 ## Install ##
 #############
+install(
+  PROGRAMS
+    scripts/mono_vo_node.py
+    scripts/stereo_vo_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 # all install targets should use catkin DESTINATION variables
 # See http://ros.org/doc/api/catkin/html/adv_user_guide/variables.html
