@@ -4,5 +4,8 @@
     ],
     "python.analysis.extraPaths": [
         "/opt/ros/noetic/lib/python3/dist-packages"
+    ],
+    "cursorpyright.analysis.extraPaths": [
+        "/opt/ros/noetic/lib/python3/dist-packages"
     ]
 }
