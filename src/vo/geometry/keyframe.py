@@ -25,6 +25,7 @@ class KeyFrame:
             pose (np.ndarray): 4x4 transformation matrix (camera to world)
             keyframe_id (int): Unique ID for this keyframe
         """
+        
         # Basic information
         self.mnFrameId = frame_id
         self.mTimeStamp = timestamp
