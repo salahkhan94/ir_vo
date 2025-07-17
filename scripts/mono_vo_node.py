@@ -20,3 +20,4 @@ class MonoVONode(BaseImageNode):
 if __name__ == "__main__":
     MonoVONode()
     import rospy; rospy.spin()
+
