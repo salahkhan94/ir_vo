@@ -9,6 +9,7 @@ import cv2
 # Import feature detection and drawing modules
 from vo.features.detectors import build_detector
 from vo.features.draw import draw_keypoints
+from vo.vo_processor import VOProcessor
 
 class BaseImageNode(object):
     """
@@ -29,6 +30,9 @@ class BaseImageNode(object):
 
         # Initialize default detector
         self.det = build_detector("orb")
+        
+        # Initialize VO processor for pose estimation
+        self.vo_processor = VOProcessor("orb")
 
         if stereo:
             # Stereo mode: expect tuples for topics
@@ -91,7 +95,7 @@ class BaseImageNode(object):
     def handle_frame(self, cv_img, info_msg, header):
         """
         Default implementation for monocular processing.
-        Detects ORB keypoints and draws them on the image.
+        Performs feature detection, matching, and pose estimation.
         
         Args:
             cv_img: OpenCV image (numpy array)
@@ -99,10 +103,29 @@ class BaseImageNode(object):
             header: Header from the image message
             
         Returns:
-            debug image (numpy array) with keypoints drawn
+            debug image (numpy array) with keypoints drawn and pose info
         """
+        # Process frame with VO processor for pose estimation
+        success, pose = self.vo_processor.process_frame(cv_img, info_msg)
+        
+        # Draw keypoints for visualization
         kps = self.det.detect(cv_img, None)
-        return draw_keypoints(cv_img, kps)
+        debug_img = draw_keypoints(cv_img, kps)
+        
+        # Add pose information to debug image
+        if success:
+            cv2.putText(debug_img, f"Pose: Success", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Add pose coordinates
+            if pose is not None:
+                x, y, z = pose[0, 3], pose[1, 3], pose[2, 3]
+                cv2.putText(debug_img, f"Pos: ({x:.2f}, {y:.2f}, {z:.2f})", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        else:
+            cv2.putText(debug_img, f"Pose: Failed", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        return debug_img
 
     # Default implementation for stereo processing
     def handle_stereo_frame(self, left_cv_img, right_cv_img, left_info_msg, right_info_msg, header):
