@@ -2,9 +2,10 @@
 import cv2
 import numpy as np
 import rospy
-from geometry_msgs.msg import PoseStamped, PoseArray
+from geometry_msgs.msg import PoseStamped, PoseArray, TransformStamped
 from nav_msgs.msg import Path
 from std_msgs.msg import Header
+from tf2_ros import TransformBroadcaster
 
 from vo.features.detectors import build_detector
 from vo.features.descriptors import compute_descriptors
@@ -45,6 +46,7 @@ class VOProcessor:
         # Publishers
         self.pose_pub = rospy.Publisher("~pose", PoseStamped, queue_size=10)
         self.path_pub = rospy.Publisher("~path", Path, queue_size=10)
+        self.tf_broadcaster = TransformBroadcaster()
         
         # Parameters
         self.min_matches = 50  # Minimum number of matches required
@@ -181,6 +183,18 @@ class VOProcessor:
         
         # Publish pose
         self.pose_pub.publish(pose_msg)
+        
+        # Publish transform from world to camera frame
+        transform = TransformStamped()
+        transform.header = header
+        transform.header.frame_id = "world"
+        transform.child_frame_id = "camera_frame"
+        transform.transform.translation.x = pose_msg.pose.position.x
+        transform.transform.translation.y = pose_msg.pose.position.y
+        transform.transform.translation.z = pose_msg.pose.position.z
+        transform.transform.rotation = pose_msg.pose.orientation
+        
+        self.tf_broadcaster.sendTransform(transform)
     
     def _publish_path(self, pose_matrix, header):
         """
