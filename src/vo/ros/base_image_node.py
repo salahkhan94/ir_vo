@@ -9,7 +9,7 @@ import cv2
 # Import feature detection and drawing modules
 from vo.features.detectors import build_detector
 from vo.features.draw import draw_keypoints
-from vo.vo_processor import VOProcessor
+from vo.slam_system import SLAMSystem
 
 class BaseImageNode(object):
     """
@@ -31,8 +31,8 @@ class BaseImageNode(object):
         # Initialize default detector
         self.det = build_detector("orb")
         
-        # Initialize VO processor for pose estimation
-        self.vo_processor = VOProcessor("orb")
+        # Initialize SLAM system
+        self.slam_system = SLAMSystem("orb")
 
         if stereo:
             # Stereo mode: expect tuples for topics
@@ -65,6 +65,9 @@ class BaseImageNode(object):
             self.sync.registerCallback(self._cb_mono)
 
         self.pub_dbg = rospy.Publisher("~debug", Image, queue_size=1)
+        
+        # Register shutdown handler
+        rospy.on_shutdown(self.shutdown)
 
     def _cb_mono(self, img_msg, info_msg):
         """Callback for monocular input"""
@@ -105,25 +108,27 @@ class BaseImageNode(object):
         Returns:
             debug image (numpy array) with keypoints drawn and pose info
         """
-        # Process frame with VO processor for pose estimation
-        success, pose = self.vo_processor.process_frame(cv_img, info_msg)
+        # Process frame with SLAM system
+        success, pose = self.slam_system.process_frame(cv_img, info_msg)
         
         # Draw keypoints for visualization
         kps = self.det.detect(cv_img, None)
         debug_img = draw_keypoints(cv_img, kps)
         
-        # Add pose information to debug image
-        if success:
-            cv2.putText(debug_img, f"Pose: Success", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            # Add pose coordinates
-            if pose is not None:
-                x, y, z = pose[0, 3], pose[1, 3], pose[2, 3]
-                cv2.putText(debug_img, f"Pos: ({x:.2f}, {y:.2f}, {z:.2f})", (10, 60), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        else:
-            cv2.putText(debug_img, f"Pose: Failed", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # Add tracking state and pose information to debug image
+        tracking_state = self.slam_system.tracking_state
+        cv2.putText(debug_img, f"State: {tracking_state}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if success else (0, 0, 255), 2)
+        
+        if success and pose is not None:
+            x, y, z = pose[0, 3], pose[1, 3], pose[2, 3]
+            cv2.putText(debug_img, f"Pos: ({x:.2f}, {y:.2f}, {z:.2f})", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # Add map statistics
+            num_map_points, num_keyframes = self.slam_system.map.get_map_size()
+            cv2.putText(debug_img, f"Map: {num_map_points} pts, {num_keyframes} KFs", (10, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
         return debug_img
 
@@ -168,3 +173,8 @@ class BaseImageNode(object):
         cv2.putText(debug_img, "Right", (w1 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
         return debug_img
+
+    def shutdown(self):
+        """Shutdown handler for cleanup."""
+        if hasattr(self, 'slam_system'):
+            self.slam_system.shutdown()

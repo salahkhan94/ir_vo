@@ -1,519 +1,286 @@
 #!/usr/bin/env python3
 import numpy as np
 import cv2
-from typing import Dict, List, Optional, Tuple, Set
-import threading
-from collections import defaultdict
+from threading import Lock
 
 class KeyFrame:
     """
-    Represents a keyframe with keypoints, descriptors, pose, and map point associations.
-    This is a core component of ORB-SLAM2 for storing and managing keyframe data.
+    KeyFrame class representing a keyframe in the SLAM system.
+    Similar to ORB-SLAM2 implementation.
     """
     
-    def __init__(self, frame_id: int, timestamp: float, camera, keypoints: List, descriptors: np.ndarray,
-                 pose: np.ndarray, keyframe_id: int):
+    def __init__(self, frame_id, timestamp, pose, keypoints, descriptors, camera_matrix):
         """
-        Initialize a KeyFrame.
+        Initialize a keyframe.
         
         Args:
-            frame_id (int): ID of the original frame
-            timestamp (float): Timestamp of the keyframe
-            camera: Camera object with intrinsics
-            keypoints (List): List of KeyPoint objects
-            descriptors (np.ndarray): ORB descriptors for keypoints
-            pose (np.ndarray): 4x4 transformation matrix (camera to world)
-            keyframe_id (int): Unique ID for this keyframe
+            frame_id: Unique ID for this keyframe
+            timestamp: Timestamp of the frame
+            pose: 4x4 pose matrix (camera to world transformation)
+            keypoints: List of OpenCV keypoints
+            descriptors: ORB descriptors for the keypoints
+            camera_matrix: 3x3 camera intrinsic matrix
         """
+        self.frame_id = frame_id
+        self.timestamp = timestamp
+        self.pose = pose.copy()  # 4x4 pose matrix
+        self.keypoints = list(keypoints) if keypoints is not None else []
+        self.descriptors = descriptors.copy() if descriptors is not None else None
+        self.camera_matrix = camera_matrix.copy()
         
-        # Basic information
-        self.mnFrameId = frame_id
-        self.mTimeStamp = timestamp
-        self.mnId = keyframe_id
+        # Map point associations: {feature_id: map_point}
+        self.map_points = {}
         
-        # Camera and image data
-        self.mCamera = camera
-        self.mvKeys = keypoints  # List of KeyPoint objects
-        self.mDescriptors = descriptors  # ORB descriptors
+        # Covisible keyframes: {keyframe_id: weight}
+        self.covisible_keyframes = {}
         
-        # Pose information
-        self.mTcw = pose.astype(np.float32)  # Camera to world transformation
-        self.mTwc = np.linalg.inv(self.mTcw).astype(np.float32)  # World to camera transformation
+        # BoW (Bag of Words) representation (placeholder for future)
+        self.bow_vec = None
+        self.feature_vec = None
         
-        # Map point associations
-        self.mvpMapPoints = [None] * len(keypoints)  # MapPoint objects for each keypoint
+        # Scale pyramid info
+        self.scale_levels = 8
+        self.scale_factor = 1.2
+        self.log_scale_factor = np.log(self.scale_factor)
         
-        # Covisibility graph
-        self.mConnectedKeyFrameWeights = {}  # keyframe_id -> weight
-        self.mvpOrderedConnectedKeyFrames = []  # Ordered list of connected keyframes
-        self.mvOrderedWeights = []  # Weights corresponding to ordered keyframes
-        
-        # Spanning tree
-        self.mbFirstConnection = True
-        self.mpParent = None  # Parent keyframe in spanning tree
-        self.mspChildrens = set()  # Children keyframes in spanning tree
-        self.mspLoopEdges = set()  # Loop closure edges
-        
-        # BoW (Bag of Words) representation
-        self.mBowVec = None
-        self.mFeatVec = None
-        
-        # Scale pyramid information
-        self.mnScaleLevels = 8
-        self.mfScaleFactor = 1.2
-        self.mfLogScaleFactor = np.log(self.mfScaleFactor)
-        self.mvScaleFactors = [self.mfScaleFactor ** i for i in range(self.mnScaleLevels)]
-        self.mvInvScaleFactors = [1.0 / sf for sf in self.mvScaleFactors]
-        self.mvLevelSigma2 = [self.mvScaleFactors[i] ** 2 for i in range(self.mnScaleLevels)]
-        self.mvInvLevelSigma2 = [1.0 / s2 for s2 in self.mvLevelSigma2]
-        
-        # Undistorted keypoints
-        self.mvKeysUn = []
-        self._compute_undistorted_keypoints()
-        
-        # Mutex for thread safety
-        self.mMutexPose = threading.RLock()
-        self.mMutexConnections = threading.RLock()
-        self.mMutexFeatures = threading.RLock()
-        
-    def __str__(self):
-        return f"KeyFrame(id={self.mnId}, frame_id={self.mnFrameId}, keypoints={len(self.mvKeys)})"
+        # Thread safety
+        self.lock = Lock()
     
-    def __repr__(self):
-        return self.__str__()
-    
-    def _compute_undistorted_keypoints(self):
-        """Compute undistorted keypoints."""
-        if len(self.mvKeys) == 0:
-            return
-        
-        # Extract keypoint coordinates
-        points = np.array([[kp.x, kp.y] for kp in self.mvKeys])
-        
-        # Undistort points
-        undistorted_points = self.mCamera.undistort_points(points)
-        
-        # Create undistorted keypoints
-        self.mvKeysUn = []
-        for i, (kp, undist_pt) in enumerate(zip(self.mvKeys, undistorted_points)):
-            undist_kp = cv2.KeyPoint(
-                x=undist_pt[0], y=undist_pt[1],
-                size=kp.size, angle=kp.angle,
-                response=kp.response, octave=kp.octave,
-                class_id=kp.class_id
-            )
-            self.mvKeysUn.append(undist_kp)
-    
-    def get_keypoints(self) -> List:
+    def add_map_point(self, feature_id, map_point):
         """
-        Get all keypoints.
-        
-        Returns:
-            List: List of KeyPoint objects
-        """
-        return self.mvKeys.copy()
-    
-    def get_undistorted_keypoints(self) -> List:
-        """
-        Get undistorted keypoints.
-        
-        Returns:
-            List: List of undistorted KeyPoint objects
-        """
-        return self.mvKeysUn.copy()
-    
-    def get_keypoint(self, idx: int):
-        """
-        Get a specific keypoint.
+        Associate a map point with a feature in this keyframe.
         
         Args:
-            idx (int): Index of the keypoint
+            feature_id: Index of the feature in this keyframe
+            map_point: MapPoint object
+        """
+        with self.lock:
+            self.map_points[feature_id] = map_point
+    
+    def remove_map_point(self, feature_id):
+        """
+        Remove a map point association.
+        
+        Args:
+            feature_id: Index of the feature
+        """
+        with self.lock:
+            if feature_id in self.map_points:
+                del self.map_points[feature_id]
+    
+    def get_map_point(self, feature_id):
+        """
+        Get the map point associated with a feature.
+        
+        Args:
+            feature_id: Index of the feature
             
         Returns:
-            KeyPoint: KeyPoint object at the given index
+            MapPoint object if associated, None otherwise
         """
-        if 0 <= idx < len(self.mvKeys):
-            return self.mvKeys[idx]
-        return None
+        with self.lock:
+            return self.map_points.get(feature_id, None)
     
-    def get_undistorted_keypoint(self, idx: int):
+    def get_map_points(self):
         """
-        Get a specific undistorted keypoint.
+        Get all map point associations.
+        
+        Returns:
+            Dictionary of {feature_id: map_point}
+        """
+        with self.lock:
+            return self.map_points.copy()
+    
+    def get_pose(self):
+        """
+        Get the pose of this keyframe.
+        
+        Returns:
+            4x4 pose matrix
+        """
+        with self.lock:
+            return self.pose.copy()
+    
+    def set_pose(self, pose):
+        """
+        Set the pose of this keyframe.
         
         Args:
-            idx (int): Index of the keypoint
-            
-        Returns:
-            cv2.KeyPoint: Undistorted KeyPoint object at the given index
+            pose: New 4x4 pose matrix
         """
-        if 0 <= idx < len(self.mvKeysUn):
-            return self.mvKeysUn[idx]
-        return None
+        with self.lock:
+            self.pose = pose.copy()
     
-    def get_descriptors(self) -> np.ndarray:
-        """
-        Get all descriptors.
-        
-        Returns:
-            np.ndarray: ORB descriptors
-        """
-        return self.mDescriptors.copy()
-    
-    def get_descriptor(self, idx: int) -> Optional[np.ndarray]:
-        """
-        Get a specific descriptor.
-        
-        Args:
-            idx (int): Index of the descriptor
-            
-        Returns:
-            np.ndarray or None: Descriptor at the given index
-        """
-        if 0 <= idx < len(self.mDescriptors):
-            return self.mDescriptors[idx].copy()
-        return None
-    
-    def get_pose(self) -> np.ndarray:
-        """
-        Get the camera to world transformation.
-        
-        Returns:
-            np.ndarray: 4x4 transformation matrix
-        """
-        with self.mMutexPose:
-            return self.mTcw.copy()
-    
-    def get_inverse_pose(self) -> np.ndarray:
-        """
-        Get the world to camera transformation.
-        
-        Returns:
-            np.ndarray: 4x4 transformation matrix
-        """
-        with self.mMutexPose:
-            return self.mTwc.copy()
-    
-    def set_pose(self, pose: np.ndarray):
-        """
-        Set the camera to world transformation.
-        
-        Args:
-            pose (np.ndarray): 4x4 transformation matrix
-        """
-        with self.mMutexPose:
-            self.mTcw = pose.astype(np.float32)
-            self.mTwc = np.linalg.inv(self.mTcw).astype(np.float32)
-    
-    def get_rotation(self) -> np.ndarray:
-        """
-        Get the rotation matrix.
-        
-        Returns:
-            np.ndarray: 3x3 rotation matrix
-        """
-        with self.mMutexPose:
-            return self.mTcw[:3, :3].copy()
-    
-    def get_translation(self) -> np.ndarray:
-        """
-        Get the translation vector.
-        
-        Returns:
-            np.ndarray: 3x1 translation vector
-        """
-        with self.mMutexPose:
-            return self.mTcw[:3, 3].copy()
-    
-    def get_center(self) -> np.ndarray:
+    def get_camera_center(self):
         """
         Get the camera center in world coordinates.
         
         Returns:
-            np.ndarray: 3x1 camera center vector
+            3D camera center position
         """
-        with self.mMutexPose:
-            return self.mTwc[:3, 3].copy()
+        with self.lock:
+            return self.pose[:3, 3].copy()
     
-    def get_map_point(self, idx: int):
+    def get_rotation(self):
         """
-        Get the map point associated with a keypoint.
+        Get the rotation matrix of this keyframe.
+        
+        Returns:
+            3x3 rotation matrix
+        """
+        with self.lock:
+            return self.pose[:3, :3].copy()
+    
+    def get_translation(self):
+        """
+        Get the translation vector of this keyframe.
+        
+        Returns:
+            3D translation vector
+        """
+        with self.lock:
+            return self.pose[:3, 3].copy()
+    
+    def get_keypoint(self, feature_id):
+        """
+        Get a keypoint by feature ID.
         
         Args:
-            idx (int): Index of the keypoint
+            feature_id: Index of the feature
             
         Returns:
-            MapPoint or None: Associated map point
+            OpenCV keypoint if valid, None otherwise
         """
-        if 0 <= idx < len(self.mvpMapPoints):
-            return self.mvpMapPoints[idx]
-        return None
+        with self.lock:
+            if 0 <= feature_id < len(self.keypoints):
+                return self.keypoints[feature_id]
+            return None
     
-    def set_map_point(self, idx: int, map_point):
+    def get_keypoints(self):
         """
-        Set the map point associated with a keypoint.
+        Get all keypoints.
+        
+        Returns:
+            List of OpenCV keypoints
+        """
+        with self.lock:
+            return self.keypoints.copy()
+    
+    def get_descriptor(self, feature_id):
+        """
+        Get a descriptor by feature ID.
         
         Args:
-            idx (int): Index of the keypoint
-            map_point: MapPoint object to associate
-        """
-        if 0 <= idx < len(self.mvpMapPoints):
-            self.mvpMapPoints[idx] = map_point
-    
-    def get_map_points(self) -> List:
-        """
-        Get all associated map points.
-        
-        Returns:
-            List: List of MapPoint objects
-        """
-        return self.mvpMapPoints.copy()
-    
-    def get_observed_map_points(self) -> List:
-        """
-        Get all observed map points (non-None).
-        
-        Returns:
-            List: List of observed MapPoint objects
-        """
-        return [mp for mp in self.mvpMapPoints if mp is not None]
-    
-    def add_connection(self, keyframe, weight: int):
-        """
-        Add a connection to another keyframe.
-        
-        Args:
-            keyframe: KeyFrame object to connect to
-            weight (int): Weight of the connection
-        """
-        with self.mMutexConnections:
-            self.mConnectedKeyFrameWeights[keyframe.mnId] = weight
-    
-    def erase_connection(self, keyframe):
-        """
-        Remove a connection to another keyframe.
-        
-        Args:
-            keyframe: KeyFrame object to disconnect from
-        """
-        with self.mMutexConnections:
-            if keyframe.mnId in self.mConnectedKeyFrameWeights:
-                del self.mConnectedKeyFrameWeights[keyframe.mnId]
-    
-    def get_connected_keyframes(self) -> Dict[int, int]:
-        """
-        Get all connected keyframes with weights.
-        
-        Returns:
-            Dict[int, int]: Dictionary mapping keyframe_id to weight
-        """
-        with self.mMutexConnections:
-            return self.mConnectedKeyFrameWeights.copy()
-    
-    def get_ordered_connected_keyframes(self) -> List:
-        """
-        Get ordered list of connected keyframes.
-        
-        Returns:
-            List: Ordered list of connected KeyFrame objects
-        """
-        with self.mMutexConnections:
-            return self.mvpOrderedConnectedKeyFrames.copy()
-    
-    def get_ordered_weights(self) -> List[int]:
-        """
-        Get ordered list of connection weights.
-        
-        Returns:
-            List[int]: Ordered list of weights
-        """
-        with self.mMutexConnections:
-            return self.mvOrderedWeights.copy()
-    
-    def update_connections(self):
-        """Update the ordered list of connected keyframes based on weights."""
-        with self.mMutexConnections:
-            # Sort connections by weight
-            sorted_connections = sorted(
-                self.mConnectedKeyFrameWeights.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
-            
-            # Update ordered lists
-            self.mvpOrderedConnectedKeyFrames = []
-            self.mvOrderedWeights = []
-            
-            for keyframe_id, weight in sorted_connections:
-                # Find the keyframe object (this would need access to the map)
-                # For now, we'll store the IDs
-                self.mvpOrderedConnectedKeyFrames.append(keyframe_id)
-                self.mvOrderedWeights.append(weight)
-    
-    def get_best_covisibles(self, N: int = 10) -> List:
-        """
-        Get the best N covisible keyframes.
-        
-        Args:
-            N (int): Number of best covisible keyframes to return
+            feature_id: Index of the feature
             
         Returns:
-            List: List of best covisible KeyFrame objects
+            ORB descriptor if valid, None otherwise
         """
-        with self.mMutexConnections:
-            return self.mvpOrderedConnectedKeyFrames[:N]
+        with self.lock:
+            if self.descriptors is not None and 0 <= feature_id < len(self.descriptors):
+                return self.descriptors[feature_id]
+            return None
     
-    def get_covisibles_by_weight(self, min_weight: int) -> List:
+    def get_descriptors(self):
         """
-        Get covisible keyframes with weight >= min_weight.
+        Get all descriptors.
+        
+        Returns:
+            ORB descriptors array
+        """
+        with self.lock:
+            return self.descriptors.copy() if self.descriptors is not None else None
+    
+    def project_point(self, point_3d):
+        """
+        Project a 3D point to 2D image coordinates.
         
         Args:
-            min_weight (int): Minimum weight threshold
+            point_3d: 3D point in world coordinates
             
         Returns:
-            List: List of KeyFrame objects with sufficient weight
+            2D image coordinates (u, v) if valid, None otherwise
         """
-        with self.mMutexConnections:
-            covisible = []
-            for keyframe_id, weight in self.mConnectedKeyFrameWeights.items():
-                if weight >= min_weight:
-                    # Find the keyframe object (this would need access to the map)
-                    covisible.append(keyframe_id)
-            return covisible
+        with self.lock:
+            # Transform point to camera coordinates
+            point_cam = np.linalg.inv(self.pose) @ np.append(point_3d, 1.0)
+            point_cam = point_cam[:3] / point_cam[3]
+            
+            # Check if point is in front of camera
+            if point_cam[2] <= 0:
+                return None
+            
+            # Project to image coordinates
+            point_2d = self.camera_matrix @ point_cam
+            point_2d = point_2d[:2] / point_2d[2]
+            
+            return point_2d
     
-    def set_parent(self, parent_keyframe):
+    def is_in_frustum(self, point_3d, margin=1.0):
         """
-        Set the parent keyframe in the spanning tree.
+        Check if a 3D point is in the viewing frustum of this keyframe.
         
         Args:
-            parent_keyframe: Parent KeyFrame object
-        """
-        with self.mMutexConnections:
-            self.mpParent = parent_keyframe
-    
-    def get_parent(self):
-        """
-        Get the parent keyframe.
-        
+            point_3d: 3D point in world coordinates
+            margin: Margin around the image boundaries
+            
         Returns:
-            KeyFrame or None: Parent keyframe
+            True if in frustum, False otherwise
         """
-        with self.mMutexConnections:
-            return self.mpParent
+        with self.lock:
+            # Project point to image coordinates
+            point_2d = self.project_point(point_3d)
+            if point_2d is None:
+                return False
+            
+            u, v = point_2d
+            height, width = 480, 640  # Assuming standard image size
+            
+            # Check if point is within image boundaries with margin
+            if u < -margin or u > width + margin or v < -margin or v > height + margin:
+                return False
+            
+            # Check if point is in front of camera (already done in project_point)
+            return True
     
-    def add_child(self, child_keyframe):
+    def add_covisible_keyframe(self, keyframe_id, weight=1):
         """
-        Add a child keyframe.
+        Add a covisible keyframe.
         
         Args:
-            child_keyframe: Child KeyFrame object
+            keyframe_id: ID of the covisible keyframe
+            weight: Weight of the covisibility
         """
-        with self.mMutexConnections:
-            self.mspChildrens.add(child_keyframe)
+        with self.lock:
+            self.covisible_keyframes[keyframe_id] = weight
     
-    def erase_child(self, child_keyframe):
+    def get_covisible_keyframes(self):
         """
-        Remove a child keyframe.
-        
-        Args:
-            child_keyframe: Child KeyFrame object
-        """
-        with self.mMutexConnections:
-            if child_keyframe in self.mspChildrens:
-                self.mspChildrens.remove(child_keyframe)
-    
-    def get_children(self) -> Set:
-        """
-        Get all children keyframes.
+        Get all covisible keyframes.
         
         Returns:
-            Set: Set of child KeyFrame objects
+            Dictionary of {keyframe_id: weight}
         """
-        with self.mMutexConnections:
-            return self.mspChildrens.copy()
+        with self.lock:
+            return self.covisible_keyframes.copy()
     
-    def add_loop_edge(self, loop_keyframe):
-        """
-        Add a loop closure edge.
-        
-        Args:
-            loop_keyframe: KeyFrame object for loop closure
-        """
-        with self.mMutexConnections:
-            self.mspLoopEdges.add(loop_keyframe)
-    
-    def get_loop_edges(self) -> Set:
-        """
-        Get all loop closure edges.
-        
-        Returns:
-            Set: Set of loop closure KeyFrame objects
-        """
-        with self.mMutexConnections:
-            return self.mspLoopEdges.copy()
-    
-    def is_bad(self) -> bool:
-        """
-        Check if this keyframe is bad.
-        
-        Returns:
-            bool: True if bad, False otherwise
-        """
-        # A keyframe is considered bad if it has no children and is not the root
-        with self.mMutexConnections:
-            return len(self.mspChildrens) == 0 and self.mpParent is not None
-    
-    def get_scale_factor(self, level: int) -> float:
+    def get_scale_factor(self, level):
         """
         Get the scale factor for a given pyramid level.
         
         Args:
-            level (int): Pyramid level
+            level: Pyramid level
             
         Returns:
-            float: Scale factor
+            Scale factor
         """
-        if 0 <= level < self.mnScaleLevels:
-            return self.mvScaleFactors[level]
-        return 1.0
+        return self.scale_factor ** level
     
-    def get_inv_scale_factor(self, level: int) -> float:
+    def get_log_scale_factor(self):
         """
-        Get the inverse scale factor for a given pyramid level.
+        Get the log of the scale factor.
         
-        Args:
-            level (int): Pyramid level
-            
         Returns:
-            float: Inverse scale factor
+            Log of scale factor
         """
-        if 0 <= level < self.mnScaleLevels:
-            return self.mvInvScaleFactors[level]
-        return 1.0
-    
-    def get_level_sigma2(self, level: int) -> float:
-        """
-        Get the sigma squared for a given pyramid level.
-        
-        Args:
-            level (int): Pyramid level
-            
-        Returns:
-            float: Sigma squared
-        """
-        if 0 <= level < self.mnScaleLevels:
-            return self.mvLevelSigma2[level]
-        return 1.0
-    
-    def get_inv_level_sigma2(self, level: int) -> float:
-        """
-        Get the inverse sigma squared for a given pyramid level.
-        
-        Args:
-            level (int): Pyramid level
-            
-        Returns:
-            float: Inverse sigma squared
-        """
-        if 0 <= level < self.mnScaleLevels:
-            return self.mvInvLevelSigma2[level]
-        return 1.0 
+        return self.log_scale_factor 

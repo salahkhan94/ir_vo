@@ -1,243 +1,201 @@
 #!/usr/bin/env python3
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-import cv2
+from threading import Lock
 
 class MapPoint:
     """
-    Represents a 3D point in the map with observations, descriptors, and tracking information.
-    This is a core component of ORB-SLAM2 for representing map structure.
+    MapPoint class representing a 3D point in the map.
+    Similar to ORB-SLAM2 implementation.
     """
     
-    def __init__(self, world_pos: np.ndarray, first_keyframe_id: int, map_id: int):
+    def __init__(self, position_3d, first_keyframe_id, first_feature_id):
         """
-        Initialize a MapPoint.
+        Initialize a map point.
         
         Args:
-            world_pos (np.ndarray): 3D position in world coordinates (x, y, z)
-            first_keyframe_id (int): ID of the keyframe that first observed this point
-            map_id (int): Unique ID for this map point
+            position_3d: 3D position in world coordinates (numpy array)
+            first_keyframe_id: ID of the keyframe where this point was first observed
+            first_feature_id: Feature ID in the first keyframe
         """
-        self.mWorldPos = world_pos.astype(np.float32)  # 3D position in world coordinates
-        self.mnFirstKFid = first_keyframe_id           # First keyframe ID
-        self.mnId = map_id                             # Unique map point ID
+        self.position_3d = position_3d.copy()  # 3D position in world coordinates
+        self.normal = None  # Normal vector (will be computed later)
         
-        # Observations
-        self.mObservations = {}  # Dict: keyframe_id -> keypoint_index
-        self.mNormalVector = None  # Normal vector for viewing direction
-        self.mDescriptor = None    # Best descriptor for this map point
+        # Observations: {keyframe_id: feature_id}
+        self.observations = {first_keyframe_id: first_feature_id}
         
-        # Tracking
-        self.mnVisible = 1         # Number of times this point has been visible
-        self.mnFound = 1           # Number of times this point has been found
-        self.mfMaxDistance = 0     # Maximum distance for matching
-        self.mfMinDistance = 0     # Minimum distance for matching
+        # Quality metrics
+        self.observations_count = 1
+        self.bad_observations_count = 0
+        self.mean_observation_direction = None
+        self.max_distance = 0
+        self.min_distance = 0
         
-        # Bad flag
-        self.mbBad = False         # Flag indicating if this map point is bad
+        # Tracking info
+        self.track_proj_x = 0
+        self.track_proj_y = 0
+        self.track_view_cos = 0
+        self.track_scale_level = 0
+        self.track_view_cos_angle = 0
         
-        # Scale invariance
-        self.mnScaleLevels = 8     # Number of scale levels
-        self.mfScaleFactor = 1.2   # Scale factor between levels
+        # Map point status
+        self.is_bad = False
+        self.is_visible = False
+        self.is_found = False
         
-        # Covisible keyframes
-        self.mnObs = 0             # Number of observations
-        
-    def __str__(self):
-        return f"MapPoint(id={self.mnId}, pos={self.mWorldPos}, observations={len(self.mObservations)})"
+        # Thread safety
+        self.lock = Lock()
     
-    def __repr__(self):
-        return self.__str__()
-    
-    def add_observation(self, keyframe_id: int, keypoint_idx: int):
+    def add_observation(self, keyframe_id, feature_id):
         """
-        Add an observation of this map point from a keyframe.
+        Add a new observation of this map point.
         
         Args:
-            keyframe_id (int): ID of the keyframe
-            keypoint_idx (int): Index of the keypoint in the keyframe
+            keyframe_id: ID of the keyframe observing this point
+            feature_id: Feature ID in the keyframe
         """
-        self.mObservations[keyframe_id] = keypoint_idx
-        self.mnObs = len(self.mObservations)
+        with self.lock:
+            if keyframe_id not in self.observations:
+                self.observations[keyframe_id] = feature_id
+                self.observations_count += 1
     
-    def erase_observation(self, keyframe_id: int):
+    def remove_observation(self, keyframe_id):
         """
         Remove an observation of this map point.
         
         Args:
-            keyframe_id (int): ID of the keyframe to remove
+            keyframe_id: ID of the keyframe to remove
         """
-        if keyframe_id in self.mObservations:
-            del self.mObservations[keyframe_id]
-            self.mnObs = len(self.mObservations)
+        with self.lock:
+            if keyframe_id in self.observations:
+                del self.observations[keyframe_id]
+                self.observations_count -= 1
+                self.bad_observations_count += 1
     
-    def get_observations(self) -> Dict[int, int]:
+    def get_observations(self):
         """
         Get all observations of this map point.
         
         Returns:
-            Dict[int, int]: Dictionary mapping keyframe_id to keypoint_index
+            Dictionary of {keyframe_id: feature_id}
         """
-        return self.mObservations.copy()
+        with self.lock:
+            return self.observations.copy()
     
-    def get_observation_count(self) -> int:
+    def get_observations_count(self):
         """
         Get the number of observations.
         
         Returns:
-            int: Number of observations
+            Number of observations
         """
-        return self.mnObs
+        with self.lock:
+            return self.observations_count
     
-    def set_world_pos(self, world_pos: np.ndarray):
+    def is_observed_by_keyframe(self, keyframe_id):
         """
-        Set the 3D world position.
+        Check if this map point is observed by a specific keyframe.
         
         Args:
-            world_pos (np.ndarray): 3D position in world coordinates
-        """
-        self.mWorldPos = world_pos.astype(np.float32)
-    
-    def get_world_pos(self) -> np.ndarray:
-        """
-        Get the 3D world position.
-        
+            keyframe_id: ID of the keyframe to check
+            
         Returns:
-            np.ndarray: 3D position in world coordinates
+            True if observed, False otherwise
         """
-        return self.mWorldPos.copy()
+        with self.lock:
+            return keyframe_id in self.observations
     
-    def set_normal_vector(self, normal: np.ndarray):
+    def get_feature_id_in_keyframe(self, keyframe_id):
         """
-        Set the normal vector for viewing direction.
+        Get the feature ID of this map point in a specific keyframe.
         
         Args:
-            normal (np.ndarray): Normal vector
-        """
-        self.mNormalVector = normal.astype(np.float32)
-    
-    def get_normal_vector(self) -> Optional[np.ndarray]:
-        """
-        Get the normal vector.
-        
+            keyframe_id: ID of the keyframe
+            
         Returns:
-            np.ndarray or None: Normal vector if set
+            Feature ID if observed, None otherwise
         """
-        return self.mNormalVector.copy() if self.mNormalVector is not None else None
-    
-    def set_descriptor(self, descriptor: np.ndarray):
-        """
-        Set the best descriptor for this map point.
-        
-        Args:
-            descriptor (np.ndarray): ORB descriptor
-        """
-        self.mDescriptor = descriptor.copy()
-    
-    def get_descriptor(self) -> Optional[np.ndarray]:
-        """
-        Get the best descriptor.
-        
-        Returns:
-            np.ndarray or None: ORB descriptor if set
-        """
-        return self.mDescriptor.copy() if self.mDescriptor is not None else None
-    
-    def increase_visible(self, n: int = 1):
-        """
-        Increase the visible count.
-        
-        Args:
-            n (int): Number to increase by
-        """
-        self.mnVisible += n
-    
-    def increase_found(self, n: int = 1):
-        """
-        Increase the found count.
-        
-        Args:
-            n (int): Number to increase by
-        """
-        self.mnFound += n
-    
-    def get_visible_ratio(self) -> float:
-        """
-        Get the ratio of found to visible observations.
-        
-        Returns:
-            float: Ratio of found to visible observations
-        """
-        if self.mnVisible == 0:
-            return 0.0
-        return self.mnFound / self.mnVisible
+        with self.lock:
+            return self.observations.get(keyframe_id, None)
     
     def set_bad(self):
         """Mark this map point as bad."""
-        self.mbBad = True
+        with self.lock:
+            self.is_bad = True
     
-    def is_bad(self) -> bool:
+    def is_bad_point(self):
         """
-        Check if this map point is bad.
+        Check if this map point is marked as bad.
         
         Returns:
-            bool: True if bad, False otherwise
+            True if bad, False otherwise
         """
-        return self.mbBad
+        with self.lock:
+            return self.is_bad
     
-    def set_max_distance(self, distance: float):
+    def get_position(self):
         """
-        Set the maximum distance for matching.
-        
-        Args:
-            distance (float): Maximum distance
-        """
-        self.mfMaxDistance = distance
-    
-    def set_min_distance(self, distance: float):
-        """
-        Set the minimum distance for matching.
-        
-        Args:
-            distance (float): Minimum distance
-        """
-        self.mfMinDistance = distance
-    
-    def get_max_distance(self) -> float:
-        """
-        Get the maximum distance for matching.
+        Get the 3D position of this map point.
         
         Returns:
-            float: Maximum distance
+            3D position as numpy array
         """
-        return self.mfMaxDistance
+        with self.lock:
+            return self.position_3d.copy()
     
-    def get_min_distance(self) -> float:
+    def set_position(self, position_3d):
         """
-        Get the minimum distance for matching.
-        
-        Returns:
-            float: Minimum distance
-        """
-        return self.mfMinDistance
-    
-    def predict_scale(self, view_cos: float, level: int) -> int:
-        """
-        Predict the scale level based on viewing angle and current level.
+        Set the 3D position of this map point.
         
         Args:
-            view_cos (float): Cosine of viewing angle
-            level (int): Current pyramid level
+            position_3d: New 3D position
+        """
+        with self.lock:
+            self.position_3d = position_3d.copy()
+    
+    def compute_distinctive_descriptors(self):
+        """
+        Compute distinctive descriptors for this map point.
+        This would be used for place recognition (not implemented here).
+        """
+        # Placeholder for future implementation
+        pass
+    
+    def update_normal_and_depth(self, keyframe_poses):
+        """
+        Update the normal vector and depth information.
+        
+        Args:
+            keyframe_poses: Dictionary of {keyframe_id: pose_matrix}
+        """
+        with self.lock:
+            if len(self.observations) < 2:
+                return
+            
+            # Compute mean observation direction
+            directions = []
+            for keyframe_id in self.observations:
+                if keyframe_id in keyframe_poses:
+                    pose = keyframe_poses[keyframe_id]
+                    camera_center = pose[:3, 3]
+                    direction = self.position_3d - camera_center
+                    direction = direction / np.linalg.norm(direction)
+                    directions.append(direction)
+            
+            if directions:
+                self.mean_observation_direction = np.mean(directions, axis=0)
+                self.mean_observation_direction = self.mean_observation_direction / np.linalg.norm(self.mean_observation_direction)
+    
+    def predict_scale(self, view_cos, median_depth):
+        """
+        Predict the scale level for this map point.
+        
+        Args:
+            view_cos: Cosine of viewing angle
+            median_depth: Median depth of the scene
             
         Returns:
-            int: Predicted scale level
+            Predicted scale level
         """
-        ratio = self.mfMaxDistance / self.mfMinDistance
-        scale = 1.0 / (ratio * view_cos)
-        scale = np.clip(scale, 0.5, 2.0)
-        
-        level_scale = self.mfScaleFactor ** level
-        scale_level = int(np.log(scale / level_scale) / np.log(self.mfScaleFactor))
-        scale_level = np.clip(scale_level, 0, self.mnScaleLevels - 1)
-        
-        return scale_level 
+        # Simple scale prediction based on viewing angle and depth
+        # This is a simplified version
+        return 0  # Placeholder 

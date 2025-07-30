@@ -1,43 +1,30 @@
 #!/usr/bin/env python3
 import numpy as np
-from typing import Dict, List, Set, Optional, Tuple
-from collections import defaultdict
-import threading
+from threading import Lock
+from .mappoint import MapPoint
+from .keyframe import KeyFrame
 
 class Map:
     """
-    Represents the global map with keyframes, map points, and covisibility graph.
-    This is a core component of ORB-SLAM2 for managing the map structure.
+    Map class representing the entire SLAM map.
+    Similar to ORB-SLAM2 implementation.
     """
     
     def __init__(self):
-        """Initialize an empty map."""
-        # Map points
-        self.mspMapPoints = set()  # Set of MapPoint objects
-        self.mnMaxMPid = 0         # Maximum map point ID
+        """Initialize the map."""
+        # Map points and keyframes
+        self.map_points = {}  # {map_point_id: MapPoint}
+        self.keyframes = {}   # {keyframe_id: KeyFrame}
         
-        # Keyframes
-        self.mspKeyFrames = set()  # Set of KeyFrame objects
-        self.mnMaxKFid = 0         # Maximum keyframe ID
+        # Reference keyframes for tracking
+        self.reference_keyframe = None
         
-        # Covisibility graph
-        self.mConnectedKeyFrameWeights = defaultdict(dict)  # keyframe_id -> {neighbor_id: weight}
+        # Map statistics
+        self.max_map_point_id = 0
+        self.max_keyframe_id = 0
         
-        # Spanning tree
-        self.mvpKeyFrameOrigins = []  # Root keyframes
-        
-        # Map mutex for thread safety
-        self.mMutexMap = threading.RLock()
-        
-        # Map update flags
-        self.mbMapUpdated = False
-        self.mnMapChangeNotified = 0
-        
-    def __str__(self):
-        return f"Map(keyframes={len(self.mspKeyFrames)}, mappoints={len(self.mspMapPoints)})"
-    
-    def __repr__(self):
-        return self.__str__()
+        # Thread safety
+        self.lock = Lock()
     
     def add_map_point(self, map_point):
         """
@@ -46,10 +33,11 @@ class Map:
         Args:
             map_point: MapPoint object to add
         """
-        with self.mMutexMap:
-            self.mspMapPoints.add(map_point)
-            self.mnMaxMPid = max(self.mnMaxMPid, map_point.mnId)
-            self.mbMapUpdated = True
+        with self.lock:
+            map_point_id = self.max_map_point_id
+            self.map_points[map_point_id] = map_point
+            self.max_map_point_id += 1
+            return map_point_id
     
     def add_keyframe(self, keyframe):
         """
@@ -58,270 +46,261 @@ class Map:
         Args:
             keyframe: KeyFrame object to add
         """
-        with self.mMutexMap:
-            self.mspKeyFrames.add(keyframe)
-            self.mnMaxKFid = max(self.mnMaxKFid, keyframe.mnId)
-            self.mbMapUpdated = True
+        with self.lock:
+            keyframe_id = self.max_keyframe_id
+            self.keyframes[keyframe_id] = keyframe
+            self.max_keyframe_id += 1
+            return keyframe_id
     
-    def erase_map_point(self, map_point):
+    def remove_map_point(self, map_point_id):
         """
         Remove a map point from the map.
         
         Args:
-            map_point: MapPoint object to remove
+            map_point_id: ID of the map point to remove
         """
-        with self.mMutexMap:
-            if map_point in self.mspMapPoints:
-                self.mspMapPoints.remove(map_point)
-                self.mbMapUpdated = True
+        with self.lock:
+            if map_point_id in self.map_points:
+                map_point = self.map_points[map_point_id]
+                
+                # Remove observations from keyframes
+                observations = map_point.get_observations()
+                for keyframe_id, feature_id in observations.items():
+                    if keyframe_id in self.keyframes:
+                        self.keyframes[keyframe_id].remove_map_point(feature_id)
+                
+                # Mark map point as bad
+                map_point.set_bad()
+                del self.map_points[map_point_id]
     
-    def erase_keyframe(self, keyframe):
+    def remove_keyframe(self, keyframe_id):
         """
         Remove a keyframe from the map.
         
         Args:
-            keyframe: KeyFrame object to remove
+            keyframe_id: ID of the keyframe to remove
         """
-        with self.mMutexMap:
-            if keyframe in self.mspKeyFrames:
-                self.mspKeyFrames.remove(keyframe)
-                # Remove from covisibility graph
-                if keyframe.mnId in self.mConnectedKeyFrameWeights:
-                    del self.mConnectedKeyFrameWeights[keyframe.mnId]
-                # Remove connections to this keyframe
-                for kf_id in list(self.mConnectedKeyFrameWeights.keys()):
-                    if keyframe.mnId in self.mConnectedKeyFrameWeights[kf_id]:
-                        del self.mConnectedKeyFrameWeights[kf_id][keyframe.mnId]
-                self.mbMapUpdated = True
+        with self.lock:
+            if keyframe_id in self.keyframes:
+                keyframe = self.keyframes[keyframe_id]
+                
+                # Remove map point associations
+                map_points = keyframe.get_map_points()
+                for feature_id, map_point in map_points.items():
+                    if map_point is not None:
+                        map_point.remove_observation(keyframe_id)
+                        
+                        # Remove map point if it has no observations
+                        if map_point.get_observations_count() == 0:
+                            map_point.set_bad()
+                
+                del self.keyframes[keyframe_id]
     
-    def get_map_points(self) -> Set:
+    def get_map_points(self):
         """
-        Get all map points in the map.
+        Get all map points.
         
         Returns:
-            Set: Set of MapPoint objects
+            Dictionary of {map_point_id: MapPoint}
         """
-        with self.mMutexMap:
-            return self.mspMapPoints.copy()
+        with self.lock:
+            return self.map_points.copy()
     
-    def get_keyframes(self) -> Set:
+    def get_keyframes(self):
         """
-        Get all keyframes in the map.
+        Get all keyframes.
         
         Returns:
-            Set: Set of KeyFrame objects
+            Dictionary of {keyframe_id: KeyFrame}
         """
-        with self.mMutexMap:
-            return self.mspKeyFrames.copy()
+        with self.lock:
+            return self.keyframes.copy()
     
-    def get_map_point_by_id(self, map_point_id: int):
+    def get_map_point(self, map_point_id):
         """
-        Get a map point by its ID.
+        Get a specific map point.
         
         Args:
-            map_point_id (int): ID of the map point
+            map_point_id: ID of the map point
             
         Returns:
-            MapPoint or None: MapPoint object if found, None otherwise
+            MapPoint object if exists, None otherwise
         """
-        with self.mMutexMap:
-            for mp in self.mspMapPoints:
-                if mp.mnId == map_point_id:
-                    return mp
-        return None
+        with self.lock:
+            return self.map_points.get(map_point_id, None)
     
-    def get_keyframe_by_id(self, keyframe_id: int):
+    def get_keyframe(self, keyframe_id):
         """
-        Get a keyframe by its ID.
+        Get a specific keyframe.
         
         Args:
-            keyframe_id (int): ID of the keyframe
+            keyframe_id: ID of the keyframe
             
         Returns:
-            KeyFrame or None: KeyFrame object if found, None otherwise
+            KeyFrame object if exists, None otherwise
         """
-        with self.mMutexMap:
-            for kf in self.mspKeyFrames:
-                if kf.mnId == keyframe_id:
-                    return kf
-        return None
+        with self.lock:
+            return self.keyframes.get(keyframe_id, None)
     
-    def get_map_points_count(self) -> int:
+    def set_reference_keyframe(self, keyframe):
         """
-        Get the number of map points.
-        
-        Returns:
-            int: Number of map points
-        """
-        with self.mMutexMap:
-            return len(self.mspMapPoints)
-    
-    def get_keyframes_count(self) -> int:
-        """
-        Get the number of keyframes.
-        
-        Returns:
-            int: Number of keyframes
-        """
-        with self.mMutexMap:
-            return len(self.mspKeyFrames)
-    
-    def add_connection(self, keyframe_id1: int, keyframe_id2: int, weight: int):
-        """
-        Add a connection between two keyframes in the covisibility graph.
+        Set the reference keyframe for tracking.
         
         Args:
-            keyframe_id1 (int): ID of first keyframe
-            keyframe_id2 (int): ID of second keyframe
-            weight (int): Weight of the connection (number of shared map points)
+            keyframe: KeyFrame object to set as reference
         """
-        with self.mMutexMap:
-            self.mConnectedKeyFrameWeights[keyframe_id1][keyframe_id2] = weight
-            self.mConnectedKeyFrameWeights[keyframe_id2][keyframe_id1] = weight
+        with self.lock:
+            self.reference_keyframe = keyframe
     
-    def get_connected_keyframes(self, keyframe_id: int) -> Dict[int, int]:
+    def get_reference_keyframe(self):
         """
-        Get connected keyframes for a given keyframe.
+        Get the reference keyframe.
+        
+        Returns:
+            Reference KeyFrame object
+        """
+        with self.lock:
+            return self.reference_keyframe
+    
+    def cull_map_points(self, max_observations=2, max_age=10):
+        """
+        Cull bad map points from the map.
         
         Args:
-            keyframe_id (int): ID of the keyframe
+            max_observations: Maximum number of observations for a point to be considered bad
+            max_age: Maximum age (in frames) for a point to be considered bad
+        """
+        with self.lock:
+            map_points_to_remove = []
             
-        Returns:
-            Dict[int, int]: Dictionary mapping neighbor keyframe IDs to weights
-        """
-        with self.mMutexMap:
-            return self.mConnectedKeyFrameWeights.get(keyframe_id, {}).copy()
+            for map_point_id, map_point in self.map_points.items():
+                # Check if map point is bad
+                if map_point.is_bad_point():
+                    map_points_to_remove.append(map_point_id)
+                    continue
+                
+                # Check observation count
+                observations_count = map_point.get_observations_count()
+                if observations_count <= max_observations:
+                    map_points_to_remove.append(map_point_id)
+                    continue
+                
+                # Check age (simplified - could be more sophisticated)
+                # For now, we'll use a simple heuristic based on observations
+                if observations_count < 3 and len(map_point.get_observations()) < 2:
+                    map_points_to_remove.append(map_point_id)
+            
+            # Remove bad map points
+            for map_point_id in map_points_to_remove:
+                self.remove_map_point(map_point_id)
     
-    def get_best_covisibles(self, keyframe_id: int, N: int = 10) -> List[Tuple[int, int]]:
+    def get_recent_keyframes(self, n=10):
         """
-        Get the best N covisible keyframes for a given keyframe.
+        Get the most recent N keyframes.
         
         Args:
-            keyframe_id (int): ID of the keyframe
-            N (int): Number of best covisible keyframes to return
+            n: Number of recent keyframes to return
             
         Returns:
-            List[Tuple[int, int]]: List of (keyframe_id, weight) tuples sorted by weight
+            List of recent KeyFrame objects
         """
-        with self.mMutexMap:
-            connections = self.mConnectedKeyFrameWeights.get(keyframe_id, {})
-            sorted_connections = sorted(connections.items(), key=lambda x: x[1], reverse=True)
-            return sorted_connections[:N]
+        with self.lock:
+            keyframe_list = list(self.keyframes.values())
+            keyframe_list.sort(key=lambda kf: kf.frame_id, reverse=True)
+            return keyframe_list[:n]
     
-    def get_essential_graph(self, keyframe_id: int) -> Set[int]:
+    def get_map_points_for_optimization(self, keyframe_ids):
         """
-        Get the essential graph for a keyframe (spanning tree + strong connections).
+        Get map points observed by the specified keyframes.
         
         Args:
-            keyframe_id (int): ID of the keyframe
+            keyframe_ids: List of keyframe IDs
             
         Returns:
-            Set[int]: Set of keyframe IDs in the essential graph
+            List of MapPoint objects
         """
-        with self.mMutexMap:
-            # This is a simplified version - in full ORB-SLAM2, this would include
-            # spanning tree connections and strong covisible connections
-            connections = self.mConnectedKeyFrameWeights.get(keyframe_id, {})
-            essential_graph = {keyframe_id}
+        with self.lock:
+            map_points = set()
             
-            # Add strongly connected keyframes (weight > 100)
-            for neighbor_id, weight in connections.items():
-                if weight > 100:
-                    essential_graph.add(neighbor_id)
+            for keyframe_id in keyframe_ids:
+                if keyframe_id in self.keyframes:
+                    keyframe = self.keyframes[keyframe_id]
+                    keyframe_map_points = keyframe.get_map_points()
+                    for map_point in keyframe_map_points.values():
+                        if map_point is not None and not map_point.is_bad_point():
+                            map_points.add(map_point)
             
-            return essential_graph
+            return list(map_points)
+    
+    def get_observations_for_optimization(self, keyframe_ids):
+        """
+        Get all 3D-2D observations for optimization.
+        
+        Args:
+            keyframe_ids: List of keyframe IDs
+            
+        Returns:
+            Dictionary of {keyframe_id: {feature_id: (map_point, keypoint)}}
+        """
+        with self.lock:
+            observations = {}
+            
+            for keyframe_id in keyframe_ids:
+                if keyframe_id in self.keyframes:
+                    keyframe = self.keyframes[keyframe_id]
+                    keyframe_observations = {}
+                    
+                    map_points = keyframe.get_map_points()
+                    for feature_id, map_point in map_points.items():
+                        if map_point is not None and not map_point.is_bad_point():
+                            keypoint = keyframe.get_keypoint(feature_id)
+                            if keypoint is not None:
+                                keyframe_observations[feature_id] = (map_point, keypoint)
+                    
+                    if keyframe_observations:
+                        observations[keyframe_id] = keyframe_observations
+            
+            return observations
+    
+    def update_map_point_positions(self, map_point_positions):
+        """
+        Update map point positions after optimization.
+        
+        Args:
+            map_point_positions: Dictionary of {map_point_id: new_position}
+        """
+        with self.lock:
+            for map_point_id, new_position in map_point_positions.items():
+                if map_point_id in self.map_points:
+                    self.map_points[map_point_id].set_position(new_position)
+    
+    def update_keyframe_poses(self, keyframe_poses):
+        """
+        Update keyframe poses after optimization.
+        
+        Args:
+            keyframe_poses: Dictionary of {keyframe_id: new_pose}
+        """
+        with self.lock:
+            for keyframe_id, new_pose in keyframe_poses.items():
+                if keyframe_id in self.keyframes:
+                    self.keyframes[keyframe_id].set_pose(new_pose)
+    
+    def get_map_size(self):
+        """
+        Get the size of the map.
+        
+        Returns:
+            Tuple of (num_map_points, num_keyframes)
+        """
+        with self.lock:
+            return len(self.map_points), len(self.keyframes)
     
     def clear(self):
         """Clear the entire map."""
-        with self.mMutexMap:
-            self.mspMapPoints.clear()
-            self.mspKeyFrames.clear()
-            self.mConnectedKeyFrameWeights.clear()
-            self.mvpKeyFrameOrigins.clear()
-            self.mnMaxMPid = 0
-            self.mnMaxKFid = 0
-            self.mbMapUpdated = True
-    
-    def is_empty(self) -> bool:
-        """
-        Check if the map is empty.
-        
-        Returns:
-            bool: True if map is empty, False otherwise
-        """
-        with self.mMutexMap:
-            return len(self.mspMapPoints) == 0 and len(self.mspKeyFrames) == 0
-    
-    def get_reference_map_points(self) -> List:
-        """
-        Get reference map points (well-observed map points).
-        
-        Returns:
-            List: List of reference MapPoint objects
-        """
-        with self.mMutexMap:
-            reference_mps = []
-            for mp in self.mspMapPoints:
-                if mp.get_observation_count() >= 3 and not mp.is_bad():
-                    reference_mps.append(mp)
-            return reference_mps
-    
-    def get_all_map_points(self) -> List:
-        """
-        Get all map points as a list.
-        
-        Returns:
-            List: List of all MapPoint objects
-        """
-        with self.mMutexMap:
-            return list(self.mspMapPoints)
-    
-    def get_all_keyframes(self) -> List:
-        """
-        Get all keyframes as a list.
-        
-        Returns:
-            List: List of all KeyFrame objects
-        """
-        with self.mMutexMap:
-            return list(self.mspKeyFrames)
-    
-    def set_map_updated(self):
-        """Mark the map as updated."""
-        with self.mMutexMap:
-            self.mbMapUpdated = True
-    
-    def is_map_updated(self) -> bool:
-        """
-        Check if the map has been updated.
-        
-        Returns:
-            bool: True if map has been updated, False otherwise
-        """
-        with self.mMutexMap:
-            return self.mbMapUpdated
-    
-    def get_map_change_index(self) -> int:
-        """
-        Get the map change notification index.
-        
-        Returns:
-            int: Map change notification index
-        """
-        with self.mMutexMap:
-            return self.mnMapChangeNotified
-    
-    def inform_new_big_change(self):
-        """Inform that a big change has occurred in the map."""
-        with self.mMutexMap:
-            self.mnMapChangeNotified += 1
-    
-    def get_last_big_change_idx(self) -> int:
-        """
-        Get the index of the last big change.
-        
-        Returns:
-            int: Index of the last big change
-        """
-        with self.mMutexMap:
-            return self.mnMapChangeNotified 
+        with self.lock:
+            self.map_points.clear()
+            self.keyframes.clear()
+            self.reference_keyframe = None
+            self.max_map_point_id = 0
+            self.max_keyframe_id = 0 

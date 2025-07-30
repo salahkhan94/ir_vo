@@ -19,17 +19,17 @@ def estimate_fundamental_matrix(pts1, pts2, method=cv2.FM_RANSAC, ransac_reproj_
     F, mask = cv2.findFundamentalMat(pts1, pts2, method, ransac_reproj_thresh)
     return F, mask
 
-def estimate_essential_matrix(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0):
+def estimate_essential_matrix(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.5):
     """
-    Estimate Essential Matrix from matched points and camera intrinsics.
+    Estimate Essential Matrix from matched points and camera intrinsics using RANSAC.
     
     Args:
         pts1: Points from first frame (Nx1x2 array)
         pts2: Points from second frame (Nx1x2 array)
         K: Camera intrinsic matrix (3x3)
-        method: Method for essential matrix estimation
-        prob: Confidence level
-        threshold: RANSAC threshold
+        method: Method for essential matrix estimation (default: RANSAC)
+        prob: Confidence level (default: 0.999 for 99.9% confidence)
+        threshold: RANSAC threshold in pixels (default: 1.5 for KITTI)
     
     Returns:
         E: Essential matrix

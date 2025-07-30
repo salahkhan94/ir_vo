@@ -50,7 +50,7 @@ class VOProcessor:
         
         # Parameters
         self.min_matches = 50  # Minimum number of matches required
-        self.min_inliers = 30  # Minimum number of inliers required
+        self.min_inliers = 15  # Minimum number of inliers required (lowered for KITTI)
         
     def process_frame(self, frame, camera_info):
         """
