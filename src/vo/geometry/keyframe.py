@@ -91,6 +91,19 @@ class KeyFrame:
         with self.lock:
             return self.map_points.copy()
     
+    def has_map_point(self, feature_id):
+        """
+        Check if a feature has an associated map point.
+        
+        Args:
+            feature_id: Index of the feature
+            
+        Returns:
+            True if feature has associated map point, False otherwise
+        """
+        with self.lock:
+            return feature_id in self.map_points
+    
     def get_pose(self):
         """
         Get the pose of this keyframe.

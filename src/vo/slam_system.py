@@ -7,6 +7,7 @@ import time
 from scipy.optimize import least_squares
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Path
+from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
 from vo.features.detectors import build_detector
@@ -56,6 +57,7 @@ class SLAMSystem:
         # Publishers
         self.pose_pub = rospy.Publisher("~pose", PoseStamped, queue_size=10)
         self.path_pub = rospy.Publisher("~path", Path, queue_size=10)
+        self.debug_pub = rospy.Publisher("~debug_info", String, queue_size=10)
         self.tf_broadcaster = TransformBroadcaster()
         
         # Threading
@@ -69,13 +71,13 @@ class SLAMSystem:
         
         # Tracking failure handling
         self.tracking_failure_count = 0
-        self.max_tracking_failures = 5  # Reinitialize after 5 consecutive failures
+        self.max_tracking_failures = 10  # Increased from 5 to 10 for more robustness
         
         # Reinitialization flag
         self.reinitializing = False
         
         # Initialize mapping thread
-        self.start_mapping_thread()
+        # self.start_mapping_thread()  # Commented out to focus on tracking only
     
     def start_mapping_thread(self):
         """Start the mapping thread for bundle adjustment."""
@@ -121,46 +123,56 @@ class SLAMSystem:
         keypoints, descriptors = compute_descriptors(self.detector, frame, keypoints)
         rospy.loginfo(f"Computed descriptors shape: {descriptors.shape if descriptors is not None else 'None'}")
         
-        # Store keypoints for debug visualization
+        # Store current frame data for potential initialization
+        self._current_frame = frame.copy()
         self._current_keypoints = keypoints
+        self._current_descriptors = descriptors
+        self._current_camera_info = camera_info
         
-        # Update tracking state
-        rospy.loginfo(f"Current tracking state: {self.tracking_state}")
-        if self.tracking_state == "NO_IMAGES_YET":
-            rospy.loginfo("Creating first keyframe...")
-            self.tracking_state = "NOT_INITIALIZED"
-            # Set initial pose to identity for first keyframe
-            self.current_pose = np.eye(4)
+        # If not initialized, try to initialize with two frames
+        if self.tracking_state == "NOT_INITIALIZED":
+            rospy.loginfo("System not initialized, attempting two-frame initialization...")
             
-            # Try to create the first keyframe with timeout
-            rospy.loginfo("Attempting to create first keyframe...")
-            new_keyframe = self.create_keyframe(frame, keypoints, descriptors, K, camera_info.header)
-            if new_keyframe is not None:
-                self.reference_keyframe = new_keyframe
-                self.current_frame_id += 1
-                rospy.loginfo(f"First keyframe created successfully with ID: {new_keyframe.frame_id}")
-                rospy.loginfo("Waiting for more frames...")
-                return False, None
-            else:
-                rospy.logwarn("Failed to create first keyframe, trying simple fallback...")
-                # Create a simple keyframe without map operations
-                try:
-                    simple_keyframe = KeyFrame(
-                        frame_id=self.current_frame_id,
-                        timestamp=camera_info.header.stamp.to_sec(),
-                        pose=self.current_pose,
-                        keypoints=keypoints,
-                        descriptors=descriptors,
-                        camera_matrix=K
-                    )
-                    self.reference_keyframe = simple_keyframe
-                    rospy.loginfo("Created simple fallback keyframe")
-                except Exception as e:
-                    rospy.logerr(f"Failed to create fallback keyframe: {e}")
+            # If we have a previous frame, try initialization
+            if hasattr(self, '_prev_frame') and self._prev_frame is not None:
+                rospy.loginfo("Attempting initialization with previous frame...")
                 
-                rospy.logwarn(f"Current state: {self.tracking_state}, Reference keyframe: {self.reference_keyframe}")
-                self.current_frame_id += 1
-                return False, None
+                # Try to initialize with previous and current frame
+                success = self.initialize_system(
+                    self._prev_frame, 
+                    self._prev_keypoints, 
+                    self._prev_descriptors,
+                    frame, 
+                    keypoints, 
+                    descriptors, 
+                    K
+                )
+                
+                if success:
+                    rospy.loginfo("Two-frame initialization successful!")
+                    self.current_frame_id += 1
+                    return True, self.current_pose
+                else:
+                    rospy.logwarn("Two-frame initialization failed, storing current frame and continuing...")
+            
+            # Store current frame as previous frame for next attempt
+            self._prev_frame = frame.copy()
+            self._prev_keypoints = keypoints
+            self._prev_descriptors = descriptors
+            self._prev_camera_info = camera_info
+            
+            self.current_frame_id += 1
+            return False, None
+        elif self.tracking_state == "NO_IMAGES_YET":
+            # First frame - store it and wait for second frame
+            rospy.loginfo("First frame received, storing for initialization...")
+            self.tracking_state = "NOT_INITIALIZED"
+            self._prev_frame = frame.copy()
+            self._prev_keypoints = keypoints
+            self._prev_descriptors = descriptors
+            self._prev_camera_info = camera_info
+            self.current_frame_id += 1
+            return False, None
         
         # Track current frame
         rospy.loginfo("Starting frame tracking...")
@@ -242,33 +254,60 @@ class SLAMSystem:
             rospy.logwarn("No reference keyframe available")
             rospy.logwarn(f"Tracking state: {self.tracking_state}, Current frame ID: {self.current_frame_id}")
             rospy.logwarn(f"Reference keyframe is None, this should not happen in {self.tracking_state} state")
+            
+            # Publish debug information
+            debug_msg = f"Frame {self.current_frame_id}: No reference keyframe, State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
             return False, None
         
         # Get map points from reference keyframe
         map_points = self.reference_keyframe.get_map_points()
         rospy.loginfo(f"Reference keyframe has {len(map_points)} map points")
+        
+        # Debug: Check map point distribution
+        if len(map_points) > 0:
+            feature_ids_with_map_points = list(map_points.keys())
+            rospy.loginfo(f"DEBUG: Map points exist for features: {feature_ids_with_map_points[:10]}...")  # Show first 10
+            rospy.loginfo(f"DEBUG: Feature ID range: 0 to {len(self.reference_keyframe.get_keypoints()) - 1}")
+        
+        # Publish debug information about map points
+        debug_msg = f"Frame {self.current_frame_id}: Reference keyframe has {len(map_points)} map points, State: {self.tracking_state}"
+        self.debug_pub.publish(debug_msg)
+        
         if len(map_points) < 5:  # Reduced from 10 to 5 for testing
             rospy.logwarn(f"Not enough map points: {len(map_points)} < 5")
+            debug_msg = f"Frame {self.current_frame_id}: Insufficient map points ({len(map_points)}), State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
             return False, None
         
         # Match features with reference keyframe
         ref_descriptors = self.reference_keyframe.get_descriptors()
         if ref_descriptors is None:
             rospy.logwarn("No descriptors in reference keyframe")
+            debug_msg = f"Frame {self.current_frame_id}: No descriptors in reference keyframe, State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
             return False, None
         
         matches, good_matches = match_features(ref_descriptors, descriptors, self.detector_type)
         rospy.loginfo(f"Found {len(good_matches)} good matches out of {len(matches)} total matches")
         
+        # Publish debug information about matches
+        debug_msg = f"Frame {self.current_frame_id}: {len(good_matches)}/{len(matches)} matches, State: {self.tracking_state}"
+        self.debug_pub.publish(debug_msg)
+        
         # Adaptive threshold based on number of matches
-        min_matches = max(3, min(10, len(good_matches) // 10))  # Adaptive threshold
+        min_matches = max(5, min(15, len(good_matches) // 5))  # Ensure at least 5, but be more lenient
         if len(good_matches) < min_matches:
             rospy.logwarn(f"Not enough good matches: {len(good_matches)} < {min_matches}")
+            debug_msg = f"Frame {self.current_frame_id}: Insufficient matches ({len(good_matches)}/{min_matches}), State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
             return False, None
         
         # Prepare 3D-2D correspondences for PnP
         points_3d = []
         points_2d = []
+        bad_points_count = 0
+        no_map_point_count = 0
         
         for match in good_matches:
             ref_feature_id = match.queryIdx
@@ -281,15 +320,63 @@ class SLAMSystem:
                 
                 points_3d.append(point_3d)
                 points_2d.append(point_2d)
+            elif map_point is not None:
+                bad_points_count += 1
+                # Debug: Check why map point is bad
+                if bad_points_count <= 3:  # Debug first 3 bad points
+                    rospy.logwarn(f"DEBUG: Bad map point for feature {ref_feature_id}: bad={map_point.is_bad_point()}, observations={map_point.get_observations_count()}")
+            else:
+                no_map_point_count += 1
+                # Debug: Check why no map point exists
+                # if no_map_point_count <= 3:  # Debug first 3 missing points
+                #     rospy.logwarn(f"DEBUG: No map point for feature {ref_feature_id}, has_map_point={self.reference_keyframe.has_map_point(ref_feature_id)}")
         
-        min_correspondences = max(3, min(6, len(points_3d) // 10))  # Adaptive threshold
+        rospy.loginfo(f"3D-2D correspondences: {len(points_3d)} valid, {bad_points_count} bad map points, {no_map_point_count} no map point")
+        
+        # More detailed debugging
+        if len(points_3d) < 10:  # If we have very few correspondences, debug in detail
+            rospy.logwarn(f"DEBUG: Only {len(points_3d)} valid 3D-2D correspondences from {len(good_matches)} good matches")
+            rospy.logwarn(f"DEBUG: Bad map points: {bad_points_count}, No map point: {no_map_point_count}")
+            
+            # Check a few specific matches to understand the issue
+            for i, match in enumerate(good_matches[:5]):  # Check first 5 matches
+                ref_feature_id = match.queryIdx
+                map_point = self.reference_keyframe.get_map_point(ref_feature_id)
+                if map_point is not None:
+                    rospy.logwarn(f"DEBUG: Match {i}: Feature {ref_feature_id} has map point, bad={map_point.is_bad_point()}")
+                else:
+                    rospy.logwarn(f"DEBUG: Match {i}: Feature {ref_feature_id} has NO map point")
+        else:
+            # Even when we have enough correspondences, check why some matches don't have map points
+            if no_map_point_count > 0:
+                rospy.logwarn(f"DEBUG: {no_map_point_count} matches have no map points out of {len(good_matches)} total matches")
+                # Check a few random matches that don't have map points
+                no_map_point_features = []
+                for match in good_matches:
+                    ref_feature_id = match.queryIdx
+                    if not self.reference_keyframe.has_map_point(ref_feature_id):
+                        no_map_point_features.append(ref_feature_id)
+                        if len(no_map_point_features) >= 5:  # Show first 5
+                            break
+                rospy.logwarn(f"DEBUG: Features without map points: {no_map_point_features}")
+        
+        min_correspondences = max(4, min(10, len(points_3d) // 5))  # Ensure at least 4, but be more lenient
         if len(points_3d) < min_correspondences:
             rospy.logwarn(f"Not enough 3D-2D correspondences: {len(points_3d)} < {min_correspondences}")
+            debug_msg = f"Frame {self.current_frame_id}: Insufficient 3D-2D correspondences ({len(points_3d)}/{min_correspondences}), State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
             return False, None
         
         rospy.loginfo(f"Using {len(points_3d)} 3D-2D correspondences for PnP")
         points_3d = np.array(points_3d, dtype=np.float32)
         points_2d = np.array(points_2d, dtype=np.float32)
+        
+        # Ensure we have at least 4 points for PnP
+        if len(points_3d) < 4:
+            rospy.logwarn(f"Not enough 3D-2D correspondences for PnP: {len(points_3d)} < 4")
+            debug_msg = f"Frame {self.current_frame_id}: Insufficient 3D-2D correspondences for PnP ({len(points_3d)} < 4), State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
+            return False, None
         
         # Use RANSAC PnP
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -300,9 +387,11 @@ class SLAMSystem:
             iterationsCount=100
         )
         
-        min_inliers = max(3, min(10, len(points_3d) // 10))  # Adaptive threshold
+        min_inliers = max(3, min(8, len(points_3d) // 10))  # More lenient: max 8 instead of 10, min 3
         if not success or len(inliers) < min_inliers:
             rospy.logwarn(f"PnP failed or not enough inliers: success={success}, inliers={len(inliers) if inliers is not None else 0}, required={min_inliers}")
+            debug_msg = f"Frame {self.current_frame_id}: PnP failed (success={success}, inliers={len(inliers) if inliers is not None else 0}/{min_inliers}), State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
             return False, None
         
         # Convert to pose matrix
@@ -315,6 +404,10 @@ class SLAMSystem:
         rospy.loginfo(f"Publishing pose: [{pose[0,3]:.2f}, {pose[1,3]:.2f}, {pose[2,3]:.2f}]")
         self.publish_pose(pose, header)
         self.publish_path(pose, header)
+        
+        # Publish success debug information
+        debug_msg = f"Frame {self.current_frame_id}: Tracking SUCCESS! Pose: [{pose[0,3]:.2f}, {pose[1,3]:.2f}, {pose[2,3]:.2f}], State: {self.tracking_state}"
+        self.debug_pub.publish(debug_msg)
         
         return True, pose
     
@@ -364,15 +457,9 @@ class SLAMSystem:
             # Debug: Check if keyframe was actually added
             rospy.loginfo(f"Map now has {len(self.map.keyframes)} keyframes")
             
-            # If this is the first keyframe, initialize map points
-            if self.reference_keyframe is None:
-                rospy.loginfo("Initializing map points for first keyframe...")
-                self.initialize_map_points(keyframe)
-                rospy.loginfo(f"After initialization, keyframe has {len(keyframe.get_map_points())} map points")
-            else:
-                # Triangulate new map points
-                rospy.loginfo("Triangulating new map points...")
-                self.triangulate_new_points(keyframe)
+            # Triangulate new map points (system is already initialized)
+            rospy.loginfo("Triangulating new map points...")
+            self.triangulate_new_points(keyframe)
             
             # Update reference keyframe
             self.reference_keyframe = keyframe
@@ -419,8 +506,202 @@ class SLAMSystem:
             map_point = MapPoint(point_3d, keyframe.frame_id, i)
             map_point_id = self.map.add_map_point(map_point)
             keyframe.add_map_point(i, map_point)
+            
+            # Debug: Check if map point was properly added
+            if i < 5:  # Debug first 5 map points
+                rospy.loginfo(f"DEBUG: Created map point {map_point_id} for feature {i}, bad={map_point.is_bad_point()}")
+                rospy.loginfo(f"DEBUG: Keyframe has map point for feature {i}: {keyframe.has_map_point(i)}")
         
         rospy.loginfo(f"Created {len(keypoints)} map points")
+    
+    def initialize_system(self, frame1, keypoints1, descriptors1, frame2, keypoints2, descriptors2, K):
+        """
+        Initialize the SLAM system using two frames.
+        Uses Essential Matrix estimation and pose recovery for proper initialization.
+        
+        Args:
+            frame1: First frame
+            keypoints1: Keypoints from first frame
+            descriptors1: Descriptors from first frame
+            frame2: Second frame
+            keypoints2: Keypoints from second frame
+            descriptors2: Descriptors from second frame
+            K: Camera intrinsic matrix
+            
+        Returns:
+            success: Whether initialization was successful
+        """
+        rospy.loginfo("Starting two-frame initialization...")
+        
+        # 1. Match features between the two frames
+        matches, good_matches = match_features(descriptors1, descriptors2, self.detector_type)
+        rospy.loginfo(f"Found {len(good_matches)} good matches for initialization")
+        
+        if len(good_matches) < 100:
+            rospy.logwarn(f"Not enough matches for initialization: {len(good_matches)} < 100")
+            return False
+        
+        # 2. Extract matched points
+        pts1, pts2 = get_matched_points(keypoints1, keypoints2, good_matches)
+        
+        # 3. Estimate Essential Matrix
+        E, mask = cv2.findEssentialMat(pts1, pts2, K, 
+                                      method=cv2.RANSAC, 
+                                      prob=0.999, 
+                                      threshold=1.0)
+        
+        if E is None:
+            rospy.logwarn("Failed to estimate Essential Matrix")
+            return False
+        
+        # Count inliers
+        inliers = np.sum(mask)
+        rospy.loginfo(f"Essential Matrix inliers: {inliers}/{len(good_matches)}")
+        
+        if inliers < 50:
+            rospy.logwarn(f"Not enough inliers for initialization: {inliers} < 50")
+            return False
+        
+        # 4. Recover pose from Essential Matrix
+        # Use the inlier mask to filter points
+        inlier_pts1 = pts1[mask.flatten() == 1]
+        inlier_pts2 = pts2[mask.flatten() == 1]
+        
+        if len(inlier_pts1) < 50:
+            rospy.logwarn(f"Not enough inlier points for pose recovery: {len(inlier_pts1)} < 50")
+            return False
+        
+        # Debug: Check input points
+        rospy.loginfo(f"Input points shapes: pts1={inlier_pts1.shape}, pts2={inlier_pts2.shape}")
+        rospy.loginfo(f"Input points types: pts1={inlier_pts1.dtype}, pts2={inlier_pts2.dtype}")
+        rospy.loginfo(f"Essential Matrix shape: {E.shape}")
+        rospy.loginfo(f"Camera matrix shape: {K.shape}")
+        
+        # Ensure points are in the correct format for cv2.recoverPose (Nx1x2)
+        if len(inlier_pts1.shape) == 2:
+            inlier_pts1 = inlier_pts1.reshape(-1, 1, 2)
+            inlier_pts2 = inlier_pts2.reshape(-1, 1, 2)
+            rospy.loginfo(f"Reshaped points: pts1={inlier_pts1.shape}, pts2={inlier_pts2.shape}")
+        
+        retval, R, t, mask_ = cv2.recoverPose(E, inlier_pts1, inlier_pts2, K)
+        
+        if R is None or t is None:
+            rospy.logwarn("Failed to recover pose from Essential Matrix")
+            return False
+        
+        # Debug: Check shapes of R and t
+        rospy.loginfo(f"Recovered R shape: {R.shape}, t shape: {t.shape}")
+        rospy.loginfo(f"R is rotation matrix: {np.allclose(R @ R.T, np.eye(3))}")
+        rospy.loginfo(f"det(R) = {np.linalg.det(R):.6f}")
+        
+        # 5. Create pose matrices
+        pose1 = np.eye(4)  # First camera at origin
+        pose2 = np.eye(4)  # Second camera pose
+        pose2[:3, :3] = R
+        
+        # Handle translation vector - t might be 3x3 or 3x1
+        if t.shape == (3, 3):
+            # If t is 3x3, extract the translation vector (usually the last column)
+            t_vec = t[:, 2]  # or t[:, 0] depending on OpenCV version
+        else:
+            # If t is already 3x1, use it directly
+            t_vec = t.flatten()
+        
+        pose2[:3, 3] = t_vec
+        
+        rospy.loginfo(f"Recovered pose: translation = [{t_vec[0]:.3f}, {t_vec[1]:.3f}, {t_vec[2]:.3f}]")
+        
+        # 6. Triangulate 3D points using the recovered poses
+        # Use the inlier points directly (already filtered by Essential Matrix)
+        rospy.loginfo(f"Triangulating {len(inlier_pts1)} inlier points...")
+        
+        # Triangulate points
+        points_3d = self.triangulate_points(inlier_pts1, inlier_pts2, pose1, pose2, K)
+        
+        if points_3d is None or len(points_3d) == 0:
+            rospy.logwarn("Triangulation failed")
+            return False
+        
+        # 7. Validate triangulated points
+        valid_points = []
+        valid_indices = []
+        
+        for i, point_3d in enumerate(points_3d):
+            # Check if point is valid (positive depth, reasonable distance)
+            if point_3d[2] > 0.1 and point_3d[2] < 100.0:
+                valid_points.append(point_3d)
+                valid_indices.append(i)
+        
+        rospy.loginfo(f"Valid triangulated points: {len(valid_points)}/{len(points_3d)}")
+        
+        if len(valid_points) < 50:
+            rospy.logwarn(f"Not enough valid triangulated points: {len(valid_points)} < 50")
+            return False
+        
+        # 8. Create keyframes with proper poses
+        rospy.loginfo("Creating initial keyframes...")
+        
+        # First keyframe (at origin)
+        keyframe1 = KeyFrame(
+            frame_id=self.current_frame_id - 1,  # Previous frame
+            timestamp=0.0,  # Will be updated
+            pose=pose1,
+            keypoints=keypoints1,
+            descriptors=descriptors1,
+            camera_matrix=K
+        )
+        
+        # Second keyframe (with recovered pose)
+        keyframe2 = KeyFrame(
+            frame_id=self.current_frame_id,
+            timestamp=0.0,  # Will be updated
+            pose=pose2,
+            keypoints=keypoints2,
+            descriptors=descriptors2,
+            camera_matrix=K
+        )
+        
+        # 9. Add keyframes to map
+        keyframe1_id = self.map.add_keyframe(keyframe1)
+        keyframe2_id = self.map.add_keyframe(keyframe2)
+        keyframe1.frame_id = keyframe1_id
+        keyframe2.frame_id = keyframe2_id
+        
+        # 10. Create map points from triangulated 3D points
+        rospy.loginfo("Creating map points from triangulated 3D points...")
+        
+        # Get the matches that correspond to our inlier points
+        inlier_matches = [match for i, match in enumerate(good_matches) if mask[i, 0]]
+        
+        rospy.loginfo(f"Inlier matches for map point creation: {len(inlier_matches)}")
+        
+        for i, (valid_idx, point_3d) in enumerate(zip(valid_indices, valid_points)):
+            # Get the corresponding match for this valid point
+            match = inlier_matches[valid_idx]
+            
+            # Create map point
+            map_point = MapPoint(point_3d, keyframe2.frame_id, match.trainIdx)
+            map_point_id = self.map.add_map_point(map_point)
+            
+            # Add observation to second keyframe
+            keyframe2.add_map_point(match.trainIdx, map_point)
+            
+            # Add observation to first keyframe
+            keyframe1.add_map_point(match.queryIdx, map_point)
+            
+            if i < 5:  # Debug first 5 map points
+                rospy.loginfo(f"DEBUG: Created map point {map_point_id} at [{point_3d[0]:.2f}, {point_3d[1]:.2f}, {point_3d[2]:.2f}]")
+        
+        # 11. Set reference keyframe and update system state
+        self.reference_keyframe = keyframe2
+        self.map.set_reference_keyframe(keyframe2)
+        self.current_pose = pose2.copy()
+        self.tracking_state = "OK"
+        
+        rospy.loginfo(f"Initialization successful! Created {len(valid_points)} map points from {len(inlier_matches)} inlier matches")
+        rospy.loginfo(f"Reference keyframe has {len(keyframe2.get_map_points())} map points")
+        
+        return True
     
     def triangulate_new_points(self, keyframe):
         """
@@ -429,9 +710,128 @@ class SLAMSystem:
         Args:
             keyframe: Current keyframe
         """
-        # This is a simplified triangulation
-        # In practice, you'd match features between keyframes and triangulate
-        pass
+        if self.reference_keyframe is None:
+            rospy.logwarn("No reference keyframe for triangulation")
+            return
+        
+        rospy.loginfo("Starting triangulation of new map points...")
+        
+        # Get keypoints and descriptors from both keyframes
+        ref_keypoints = self.reference_keyframe.get_keypoints()
+        ref_descriptors = self.reference_keyframe.get_descriptors()
+        curr_keypoints = keyframe.get_keypoints()
+        curr_descriptors = keyframe.get_descriptors()
+        
+        if ref_descriptors is None or curr_descriptors is None:
+            rospy.logwarn("Missing descriptors for triangulation")
+            return
+        
+        # Match features between reference and current keyframe
+        matches, good_matches = match_features(ref_descriptors, curr_descriptors, self.detector_type)
+        rospy.loginfo(f"Found {len(good_matches)} good matches for triangulation")
+        
+        if len(good_matches) < 10:
+            rospy.logwarn(f"Not enough matches for triangulation: {len(good_matches)} < 10")
+            return
+        
+        # Get camera poses
+        ref_pose = self.reference_keyframe.get_pose()
+        curr_pose = keyframe.get_pose()
+        
+        # Extract matched points
+        ref_points = []
+        curr_points = []
+        
+        for match in good_matches:
+            ref_idx = match.queryIdx
+            curr_idx = match.trainIdx
+            
+            ref_points.append(ref_keypoints[ref_idx].pt)
+            curr_points.append(curr_keypoints[curr_idx].pt)
+        
+        ref_points = np.array(ref_points, dtype=np.float32)
+        curr_points = np.array(curr_points, dtype=np.float32)
+        
+        # Triangulate 3D points using the two camera poses
+        points_3d = self.triangulate_points(ref_points, curr_points, ref_pose, curr_pose, keyframe.camera_matrix)
+        
+        if points_3d is None or len(points_3d) == 0:
+            rospy.logwarn("Triangulation failed")
+            return
+        
+        # Create map points for the triangulated 3D points
+        new_map_points = 0
+        for i, (match, point_3d) in enumerate(zip(good_matches, points_3d)):
+            # Check if point is valid (positive depth, reasonable distance)
+            if point_3d[2] > 0.1 and point_3d[2] < 100.0:  # Depth between 0.1m and 100m
+                # Create map point
+                map_point = MapPoint(point_3d, keyframe.frame_id, match.trainIdx)
+                map_point_id = self.map.add_map_point(map_point)
+                
+                # Add observation to keyframe
+                keyframe.add_map_point(match.trainIdx, map_point)
+                
+                # Add observation to reference keyframe if it doesn't have this point
+                ref_feature_id = match.queryIdx
+                if not self.reference_keyframe.has_map_point(ref_feature_id):
+                    self.reference_keyframe.add_map_point(ref_feature_id, map_point)
+                    # rospy.loginfo(f"DEBUG: Added map point {map_point_id} to reference keyframe feature {ref_feature_id}")
+                # else:
+                #     rospy.loginfo(f"DEBUG: Reference keyframe already has map point for feature {ref_feature_id}")
+                
+                new_map_points += 1
+            else:
+                rospy.logwarn(f"DEBUG: Invalid 3D point {i}: depth={point_3d[2]:.2f}")
+        
+        rospy.loginfo(f"Created {new_map_points} new map points from triangulation")
+        
+        # Publish debug information about new map points
+        debug_msg = f"Frame {self.current_frame_id}: Created {new_map_points} new map points, Total map points: {len(self.map.map_points)}"
+        self.debug_pub.publish(debug_msg)
+    
+    def triangulate_points(self, points1, points2, pose1, pose2, K):
+        """
+        Triangulate 3D points from two camera poses and matched 2D points.
+        
+        Args:
+            points1: 2D points in first camera frame (Nx2)
+            points2: 2D points in second camera frame (Nx2)
+            pose1: Camera pose 1 (4x4)
+            pose2: Camera pose 2 (4x4)
+            K: Camera intrinsic matrix (3x3)
+            
+        Returns:
+            points_3d: Triangulated 3D points (Nx3)
+        """
+        if len(points1) != len(points2):
+            rospy.logwarn("Number of points don't match for triangulation")
+            return None
+        
+        if len(points1) == 0:
+            return None
+        
+        # Convert poses to camera matrices
+        R1 = pose1[:3, :3]
+        t1 = pose1[:3, 3]
+        R2 = pose2[:3, :3]
+        t2 = pose2[:3, 3]
+        
+        # Create projection matrices
+        P1 = K @ np.hstack([R1, t1.reshape(3, 1)])
+        P2 = K @ np.hstack([R2, t2.reshape(3, 1)])
+        
+        # Normalize points
+        points1_norm = cv2.undistortPoints(points1.reshape(-1, 1, 2), K, None).reshape(-1, 2)
+        points2_norm = cv2.undistortPoints(points2.reshape(-1, 1, 2), K, None).reshape(-1, 2)
+        
+        # Triangulate points
+        points_4d = cv2.triangulatePoints(P1, P2, points1_norm.T, points2_norm.T)
+        
+        # Convert to 3D points (homogeneous to 3D)
+        points_3d = points_4d[:3, :] / points_4d[3, :]
+        points_3d = points_3d.T
+        
+        return points_3d
     
     def should_create_keyframe(self):
         """
@@ -478,29 +878,22 @@ class SLAMSystem:
                         self.current_pose = np.eye(4)
                         self.reference_keyframe = None
                         
-                        rospy.loginfo("Creating new reference keyframe for reinitialization...")
-                        # Create new reference keyframe (without acquiring mutex again)
-                        keyframe = KeyFrame(
-                            frame_id=self.current_frame_id,
-                            timestamp=header.stamp.to_sec(),
-                            pose=self.current_pose,
-                            keypoints=keypoints,
-                            descriptors=descriptors,
-                            camera_matrix=K
-                        )
+                        # Clear previous frame data for fresh initialization
+                        if hasattr(self, '_prev_frame'):
+                            delattr(self, '_prev_frame')
+                        if hasattr(self, '_prev_keypoints'):
+                            delattr(self, '_prev_keypoints')
+                        if hasattr(self, '_prev_descriptors'):
+                            delattr(self, '_prev_descriptors')
+                        if hasattr(self, '_prev_camera_info'):
+                            delattr(self, '_prev_camera_info')
                         
-                        # Add to map directly (we already have the mutex)
-                        keyframe_id = self.map.add_keyframe(keyframe)
-                        keyframe.frame_id = keyframe_id
+                        rospy.loginfo("System reset for two-frame reinitialization")
                         
-                        # Initialize map points
-                        self.initialize_map_points(keyframe)
+                        # Release mutex and let the system reinitialize naturally
+                        rospy.loginfo("Reinitialization complete, system will reinitialize with next two frames")
                         
-                        # Set as reference keyframe
-                        self.reference_keyframe = keyframe
-                        self.map.set_reference_keyframe(keyframe)
-                        
-                        rospy.loginfo(f"Reinitialization completed successfully with keyframe {keyframe_id}")
+                        return
                     finally:
                         self.map_mutex.release()
                 else:
