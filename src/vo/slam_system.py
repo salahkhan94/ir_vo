@@ -85,6 +85,9 @@ class SLAMSystem:
         # Reinitialization flag
         self.reinitializing = False
         
+        # Path history for trajectory visualization
+        self.path_history = []
+        
         # Initialize mapping thread
         # self.start_mapping_thread()  # Commented out to focus on tracking only
     
@@ -177,6 +180,8 @@ class SLAMSystem:
                         
                         if success:
                             rospy.loginfo("Two-frame initialization successful!")
+                            # Clear path history for fresh trajectory after successful initialization
+                            self.path_history = []
                             self.current_frame_id += 1
                             return True, self.current_pose
                         else:
@@ -492,7 +497,9 @@ class SLAMSystem:
             self.last_keyframe_pose = self.current_pose.copy()
             
             self.last_keyframe_id = self.current_frame_id
-            rospy.loginfo(f"Created keyframe {keyframe_id}")
+            rospy.loginfo(f"✅ KEYFRAME CREATED! ID: {keyframe_id}, Frame: {self.current_frame_id}")
+            rospy.loginfo(f"   └─ Position: [{self.current_pose[0,3]:.3f}, {self.current_pose[1,3]:.3f}, {self.current_pose[2,3]:.3f}]")
+            rospy.loginfo(f"   └─ Map points: {len(self.map.get_map_points())}")
             
             return keyframe
         finally:
@@ -1084,7 +1091,12 @@ class SLAMSystem:
         should_create = motion_criteria or tracking_criteria or interval_criteria
         
         if should_create:
-            rospy.loginfo(f"Keyframe selection: motion={motion_criteria}, tracking={tracking_criteria}, interval={interval_criteria}")
+            rospy.loginfo(f"🎯 KEYFRAME SELECTED! Frame {self.current_frame_id}")
+            rospy.loginfo(f"   └─ Motion criteria: {motion_criteria}")
+            rospy.loginfo(f"   └─ Tracking criteria: {tracking_criteria}")
+            rospy.loginfo(f"   └─ Interval criteria: {interval_criteria}")
+        else:
+            rospy.loginfo(f"⏭️  No keyframe selected for frame {self.current_frame_id}")
         
         return should_create
     
@@ -1131,7 +1143,7 @@ class SLAMSystem:
             rotation_ok = rotation_angle > self.min_rotation
             
             if translation_ok or rotation_ok:
-                rospy.loginfo(f"Motion criteria met: translation={translation_distance:.3f}m, rotation={rotation_angle:.3f}rad")
+                rospy.loginfo(f"🚀 Motion criteria met: translation={translation_distance:.3f}m (threshold: {self.min_translation}m), rotation={rotation_angle:.3f}rad (threshold: {self.min_rotation}rad)")
             
             return translation_ok or rotation_ok
             
@@ -1162,7 +1174,7 @@ class SLAMSystem:
             quality_ok = tracking_quality < self.min_tracking_quality
             
             if features_ok or quality_ok:
-                rospy.loginfo(f"Tracking quality criteria met: features={tracked_features}, quality={tracking_quality:.3f}")
+                rospy.loginfo(f"📊 Tracking quality criteria met: features={tracked_features} (threshold: <{self.min_tracked_features}), quality={tracking_quality:.3f} (threshold: <{self.min_tracking_quality})")
             
             return features_ok or quality_ok
             
@@ -1286,6 +1298,9 @@ class SLAMSystem:
                         self.last_keyframe_pose = np.eye(4)  # Reset last keyframe pose
                         self.reference_keyframe = None
                         
+                        # Clear path history for fresh trajectory
+                        self.path_history = []
+                        
                         # Clear previous frame data for fresh initialization
                         if hasattr(self, '_reference_frame'):
                             delattr(self, '_reference_frame')
@@ -1312,6 +1327,9 @@ class SLAMSystem:
                     self.last_keyframe_pose = np.eye(4)  # Reset last keyframe pose
                     self.reference_keyframe = None
                     
+                    # Clear path history for fresh trajectory
+                    self.path_history = []
+                    
                     # Try to create a simple keyframe without map operations
                     rospy.loginfo("Creating simple keyframe for reinitialization...")
                     keyframe = KeyFrame(
@@ -1330,6 +1348,7 @@ class SLAMSystem:
                 self.tracking_state = "NOT_INITIALIZED"
                 self.current_pose = np.eye(4)
                 self.reference_keyframe = None
+                self.path_history = []
             finally:
                 # Resume mapping thread
                 self.reinitializing = False
@@ -1581,9 +1600,42 @@ class SLAMSystem:
             pose_matrix: 4x4 pose matrix
             header: ROS header
         """
-        # This would maintain a path history and publish it
-        # For now, we'll just publish the current pose
-        pass
+        # Add current pose to path history
+        self.path_history.append(pose_matrix.copy())
+        
+        # Create Path message
+        path_msg = Path()
+        path_msg.header = header
+        path_msg.header.frame_id = "world"
+        
+        # Add all poses to path
+        for pose in self.path_history:
+            pose_stamped = PoseStamped()
+            pose_stamped.header = header
+            pose_stamped.header.frame_id = "world"
+            
+            # Extract position
+            pose_stamped.pose.position.x = pose[0, 3]
+            pose_stamped.pose.position.y = pose[1, 3]
+            pose_stamped.pose.position.z = pose[2, 3]
+            
+            # Extract orientation
+            R = pose[:3, :3]
+            rvec, _ = cv2.Rodrigues(R)
+            angle = np.linalg.norm(rvec)
+            if angle > 1e-6:
+                axis = rvec.flatten() / angle
+                pose_stamped.pose.orientation.x = axis[0] * np.sin(angle/2)
+                pose_stamped.pose.orientation.y = axis[1] * np.sin(angle/2)
+                pose_stamped.pose.orientation.z = axis[2] * np.sin(angle/2)
+                pose_stamped.pose.orientation.w = np.cos(angle/2)
+            else:
+                pose_stamped.pose.orientation.w = 1.0
+            
+            path_msg.poses.append(pose_stamped)
+        
+        # Publish path
+        self.path_pub.publish(path_msg)
     
     def shutdown(self):
         """Shutdown the SLAM system."""
