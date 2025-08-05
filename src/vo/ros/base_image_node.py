@@ -71,12 +71,12 @@ class BaseImageNode(object):
 
     def _cb_mono(self, img_msg, info_msg):
         """Callback for monocular input"""
-        rospy.loginfo(f"Received image: {img_msg.width}x{img_msg.height}")
+#         rospy.loginfo(f"Received image: {img_msg.width}x{img_msg.height}")
         cv_img = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
         dbg = self.handle_frame(cv_img, info_msg, img_msg.header)
-        rospy.loginfo(f"handle_frame returned: {type(dbg)}")
+#         rospy.loginfo(f"handle_frame returned: {type(dbg)}")
         if dbg is not None:
-            rospy.loginfo(f"Publishing debug image with shape: {dbg.shape}")
+#             rospy.loginfo(f"Publishing debug image with shape: {dbg.shape}")
             self.pub_dbg.publish(
                 self.bridge.cv2_to_imgmsg(dbg, encoding="bgr8", header=img_msg.header)
             )
@@ -113,7 +113,7 @@ class BaseImageNode(object):
         Returns:
             debug image (numpy array) with keypoints drawn and pose info
         """
-        rospy.loginfo(f"Processing frame with timestamp: {header.stamp}")
+#         rospy.loginfo(f"Processing frame with timestamp: {header.stamp}")
         # Process frame with SLAM system
         success, pose = self.slam_system.process_frame(cv_img, info_msg)
         
@@ -128,28 +128,28 @@ class BaseImageNode(object):
         
         # Add tracking state and pose information to debug image
         tracking_state = self.slam_system.tracking_state
-        rospy.loginfo(f"Debug image - Tracking state: {tracking_state}, Success: {success}")
+#         rospy.loginfo(f"Debug image - Tracking state: {tracking_state}, Success: {success}")
         cv2.putText(debug_img, f"State: {tracking_state}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if success else (0, 0, 255), 2)
         
         # Add frame counter
         frame_id = self.slam_system.current_frame_id
-        rospy.loginfo(f"Adding frame counter: {frame_id}")
+#         rospy.loginfo(f"Adding frame counter: {frame_id}")
         cv2.putText(debug_img, f"Frame: {frame_id}", (10, 60), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         if success and pose is not None:
             x, y, z = pose[0, 3], pose[1, 3], pose[2, 3]
-            rospy.loginfo(f"Adding pose info: ({x:.2f}, {y:.2f}, {z:.2f})")
+#             rospy.loginfo(f"Adding pose info: ({x:.2f}, {y:.2f}, {z:.2f})")
             cv2.putText(debug_img, f"Pos: ({x:.2f}, {y:.2f}, {z:.2f})", (10, 90), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
             # Add map statistics (simplified to avoid deadlock)
-            rospy.loginfo("Adding map statistics...")
+#             rospy.loginfo("Adding map statistics...")
             cv2.putText(debug_img, f"Map: Active", (10, 120), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
-        rospy.loginfo(f"handle_frame returning debug image with shape: {debug_img.shape}")
+#         rospy.loginfo(f"handle_frame returning debug image with shape: {debug_img.shape}")
         return debug_img
 
     # Default implementation for stereo processing

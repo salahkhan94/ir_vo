@@ -23,6 +23,9 @@ class MapPoint:
         # Observations: {keyframe_id: feature_id}
         self.observations = {first_keyframe_id: first_feature_id}
         
+        # Frame references: {frame_id: feature_id} - for tracking frames
+        self.frame_observations = {}
+        
         # Quality metrics
         self.observations_count = 1
         self.bad_observations_count = 0
@@ -70,6 +73,64 @@ class MapPoint:
                 del self.observations[keyframe_id]
                 self.observations_count -= 1
                 self.bad_observations_count += 1
+    
+    def add_frame_observation(self, frame_id, feature_id):
+        """
+        Add a frame observation of this map point.
+        
+        Args:
+            frame_id: ID of the frame observing this point
+            feature_id: Feature ID in the frame
+        """
+        with self.lock:
+            self.frame_observations[frame_id] = feature_id
+    
+    def remove_frame_observation(self, frame_id):
+        """
+        Remove a frame observation of this map point.
+        
+        Args:
+            frame_id: ID of the frame to remove
+        """
+        with self.lock:
+            if frame_id in self.frame_observations:
+                del self.frame_observations[frame_id]
+    
+    def get_frame_observations(self):
+        """
+        Get all frame observations of this map point.
+        
+        Returns:
+            Dictionary of {frame_id: feature_id}
+        """
+        with self.lock:
+            return self.frame_observations.copy()
+    
+    def is_observed_by_frame(self, frame_id):
+        """
+        Check if this map point is observed by a specific frame.
+        
+        Args:
+            frame_id: ID of the frame to check
+            
+        Returns:
+            True if observed, False otherwise
+        """
+        with self.lock:
+            return frame_id in self.frame_observations
+    
+    def get_feature_id_in_frame(self, frame_id):
+        """
+        Get the feature ID of this map point in a specific frame.
+        
+        Args:
+            frame_id: ID of the frame
+            
+        Returns:
+            Feature ID if observed, None otherwise
+        """
+        with self.lock:
+            return self.frame_observations.get(frame_id, None)
     
     def get_observations(self):
         """

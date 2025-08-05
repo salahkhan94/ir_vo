@@ -171,10 +171,10 @@ class Map:
             max_age: Maximum age (in frames) for a point to be considered bad
         """
         import rospy
-        rospy.loginfo("  🔍 Starting map point culling...")
+#         rospy.loginfo("  🔍 Starting map point culling...")
         
         with self.lock:
-            rospy.loginfo(f"  🔍 Acquired map lock, processing {len(self.map_points)} map points")
+#             rospy.loginfo(f"  🔍 Acquired map lock, processing {len(self.map_points)} map points")
             map_points_to_remove = []
             
             for map_point_id, map_point in self.map_points.items():
@@ -194,14 +194,14 @@ class Map:
                 if observations_count < 3 and len(map_point.get_observations()) < 2:
                     map_points_to_remove.append(map_point_id)
             
-            rospy.loginfo(f"  🔍 Found {len(map_points_to_remove)} map points to remove")
+#             rospy.loginfo(f"  🔍 Found {len(map_points_to_remove)} map points to remove")
             
             # Remove bad map points
             for i, map_point_id in enumerate(map_points_to_remove):
                 # rospy.loginfo(f"  🔍 Removing map point {i+1}/{len(map_points_to_remove)}: ID {map_point_id}")
                 self.remove_map_point(map_point_id)
             
-            rospy.loginfo("  🔍 Map point culling completed")
+#             rospy.loginfo("  🔍 Map point culling completed")
     
     def get_recent_keyframes(self, n=10):
         """
