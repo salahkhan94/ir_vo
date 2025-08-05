@@ -8,7 +8,7 @@ import cv2
 
 # Import feature detection and drawing modules
 from vo.features.detectors import build_detector
-from vo.features.draw import draw_keypoints
+from vo.features.draw import draw_keypoints, draw_matched_keypoints
 from vo.slam_system import SLAMSystem
 
 class BaseImageNode(object):
@@ -117,10 +117,14 @@ class BaseImageNode(object):
         # Process frame with SLAM system
         success, pose = self.slam_system.process_frame(cv_img, info_msg)
         
-        # Draw keypoints for visualization (use the same keypoints that were already detected)
-        # We'll get them from the SLAM system to avoid detecting twice
-        kps = self.slam_system.get_current_keypoints()
-        debug_img = draw_keypoints(cv_img, kps)
+        # Draw matched keypoints for visualization (small squares around matched features)
+        matched_kps = self.slam_system.get_matched_keypoints()
+        if len(matched_kps) > 0:
+            debug_img = draw_matched_keypoints(cv_img, matched_kps, color=(0, 255, 0), size=3)
+        else:
+            # Fallback to all keypoints if no matches
+            kps = self.slam_system.get_current_keypoints()
+            debug_img = draw_keypoints(cv_img, kps)
         
         # Add tracking state and pose information to debug image
         tracking_state = self.slam_system.tracking_state

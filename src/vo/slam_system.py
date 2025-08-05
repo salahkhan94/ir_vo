@@ -95,6 +95,10 @@ class SLAMSystem:
         self.frame_window = []  # List of (frame_id, pose, keypoints, descriptors) tuples
         self.max_frame_window = 10  # Maximum number of frames in sliding window
         
+        # Keypoint tracking for debug visualization
+        self._current_keypoints = []
+        self._matched_keypoints = []
+        
         # Initialize mapping thread
         self.start_mapping_thread()  # Enable bundle adjustment thread
     
@@ -322,6 +326,15 @@ class SLAMSystem:
         """
         return getattr(self, '_current_keypoints', [])
     
+    def get_matched_keypoints(self):
+        """
+        Get the matched keypoints from the most recent frame processing.
+        
+        Returns:
+            List of matched keypoints from the last processed frame
+        """
+        return getattr(self, '_matched_keypoints', [])
+    
     def track_frame(self, frame, keypoints, descriptors, K, header):
         """
         Track the current frame using 2D-2D correspondences and Essential matrix.
@@ -342,6 +355,9 @@ class SLAMSystem:
             rospy.logwarn(f"Tracking state: {self.tracking_state}, Current frame ID: {self.current_frame_id}")
             rospy.logwarn(f"Reference keyframe is None, this should not happen in {self.tracking_state} state")
             
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
+            
             # Publish debug information
             debug_msg = f"Frame {self.current_frame_id}: No reference keyframe, State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
@@ -353,11 +369,17 @@ class SLAMSystem:
         
         if ref_descriptors is None:
             rospy.logwarn("No descriptors in reference keyframe")
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Match features between reference keyframe and current frame
         matches, good_matches = match_features(ref_descriptors, descriptors, self.detector_type)
         rospy.loginfo(f"Found {len(good_matches)} good matches out of {len(matches)} total matches")
+        
+        # Store matched keypoints for debug visualization (will be updated with inliers later)
+        matched_keypoints = [keypoints[match.trainIdx] for match in good_matches]
+        self._matched_keypoints = matched_keypoints
         
         # Publish debug information about matches
         debug_msg = f"Frame {self.current_frame_id}: {len(good_matches)}/{len(matches)} matches, State: {self.tracking_state}"
@@ -369,6 +391,8 @@ class SLAMSystem:
             rospy.logwarn(f"Not enough good matches: {len(good_matches)} < {min_matches}")
             debug_msg = f"Frame {self.current_frame_id}: Insufficient matches ({len(good_matches)}/{min_matches}), State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Extract 2D-2D correspondences
@@ -381,6 +405,8 @@ class SLAMSystem:
             rospy.logwarn("Failed to estimate Essential Matrix")
             debug_msg = f"Frame {self.current_frame_id}: Essential Matrix estimation failed, State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Count inliers from Essential Matrix
@@ -392,6 +418,8 @@ class SLAMSystem:
             rospy.logwarn(f"Not enough Essential Matrix inliers: {E_inliers} < {min_inliers}")
             debug_msg = f"Frame {self.current_frame_id}: Insufficient Essential Matrix inliers ({E_inliers}/{min_inliers}), State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Filter points using Essential Matrix mask
@@ -405,6 +433,8 @@ class SLAMSystem:
             rospy.logwarn("Failed to recover pose from Essential Matrix")
             debug_msg = f"Frame {self.current_frame_id}: Pose recovery failed, State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Count inliers from pose recovery
@@ -415,7 +445,17 @@ class SLAMSystem:
             rospy.logwarn(f"Not enough pose recovery inliers: {pose_inliers} < {min_inliers}")
             debug_msg = f"Frame {self.current_frame_id}: Insufficient pose recovery inliers ({pose_inliers}/{min_inliers}), State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
+        
+        # Update matched keypoints to only include inlier keypoints
+        # First filter by E_mask, then by pose_mask
+        e_inlier_matches = [good_matches[i] for i in range(len(good_matches)) if E_mask[i]]
+        # pose_mask corresponds to the filtered inlier_pts1/inlier_pts2, so we need to map it back
+        final_inlier_matches = [e_inlier_matches[i] for i in range(len(e_inlier_matches)) if pose_mask[i]]
+        inlier_keypoints = [keypoints[match.trainIdx] for match in final_inlier_matches]
+        self._matched_keypoints = inlier_keypoints
         
         # Construct relative pose matrix
         relative_pose = np.eye(4)
@@ -428,6 +468,8 @@ class SLAMSystem:
         # Validate reference pose
         if reference_pose is None or reference_pose.shape != (4, 4):
             rospy.logwarn(f"Invalid reference pose shape: {reference_pose.shape if reference_pose is not None else 'None'}")
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Compute global pose by composing reference pose with relative pose
@@ -436,6 +478,8 @@ class SLAMSystem:
         # Validate global pose
         if global_pose.shape != (4, 4):
             rospy.logwarn(f"Invalid global pose shape: {global_pose.shape}")
+            # Clear matched keypoints since tracking failed
+            self._matched_keypoints = []
             return False, None
         
         # Publish global pose and transform
@@ -547,7 +591,7 @@ class SLAMSystem:
             cy = keyframe.camera_matrix[1, 2]
             
             # Back-project to 3D (assuming depth of 5.0 meters)
-            depth = 5.0
+            depth = 5.0 + np.random.uniform(-1.0, 1.0)  # Add some variation
             x = (kp.pt[0] - cx) * depth / fx
             y = (kp.pt[1] - cy) * depth / fy
             z = depth
@@ -1002,6 +1046,10 @@ class SLAMSystem:
         matches, good_matches = match_features(ref_descriptors, curr_descriptors, self.detector_type)
         rospy.loginfo(f"Found {len(good_matches)} good matches for triangulation")
         
+        # Debug: Check if reference keyframe has map points
+        ref_map_points = self.reference_keyframe.get_map_points()
+        rospy.loginfo(f"📊 Reference keyframe has {len(ref_map_points)} map points")
+        
         if len(good_matches) < 10:
             rospy.logwarn(f"Not enough matches for triangulation: {len(good_matches)} < 10")
             return
@@ -1035,6 +1083,7 @@ class SLAMSystem:
         # Limit the number of new map points to avoid overwhelming the system
         max_new_map_points = 500  # Limit to 500 new map points per keyframe
         new_map_points = 0
+        invalid_depth_count = 0
         
         for i, (match, point_3d) in enumerate(zip(good_matches, points_3d)):
             # Stop if we've reached the limit
@@ -1043,7 +1092,8 @@ class SLAMSystem:
                 
             # Check if point is valid (positive depth, reasonable distance)
             # For KITTI dataset, depths can be much larger (500-600m is normal)
-            if point_3d[2] > 0.1 and point_3d[2] < 1000.0:  # Depth between 0.1m and 1000m
+            depth = point_3d[2]
+            if depth > 0.1 and depth < 1000.0:  # Depth between 0.1m and 1000m
                 # Create map point
                 map_point = MapPoint(point_3d, keyframe.frame_id, match.trainIdx)
                 map_point_id = self.map.add_map_point(map_point)
@@ -1060,10 +1110,14 @@ class SLAMSystem:
                 #     rospy.loginfo(f"DEBUG: Reference keyframe already has map point for feature {ref_feature_id}")
                 
                 new_map_points += 1
-            # else:
-            #     rospy.logwarn(f"DEBUG: Invalid 3D point {i}: depth={point_3d[2]:.2f}")
+            else:
+                invalid_depth_count += 1
+                if invalid_depth_count <= 5:  # Log first 5 invalid depths
+                    rospy.logwarn(f"DEBUG: Invalid 3D point {i}: depth={depth:.2f}")
         
         rospy.loginfo(f"Created {new_map_points} new map points from triangulation (limited to {max_new_map_points})")
+        rospy.loginfo(f"📊 Invalid depth count: {invalid_depth_count}")
+        rospy.loginfo(f"📊 Map statistics after triangulation: Total map points: {len(self.map.get_map_points())}")
         
         # Publish debug information about new map points
         debug_msg = f"Frame {self.current_frame_id}: Created {new_map_points} new map points, Total map points: {len(self.map.map_points)}"
@@ -1262,19 +1316,29 @@ class SLAMSystem:
             count: Number of tracked features
         """
         if self.reference_keyframe is None:
+            rospy.loginfo("  📊 get_tracked_feature_count: No reference keyframe")
             return 0
         
         try:
             # Count map points that are currently visible
             map_points = self.map.get_map_points()
+            total_map_points = len(map_points)
             tracked_count = 0
+            bad_points = 0
+            zero_observations = 0
             
             for map_point in map_points.values():
-                if not map_point.is_bad_point():
-                    # Check if this map point is observed by the reference keyframe
-                    if map_point.get_observations_count() > 0:
-                        tracked_count += 1
+                if map_point.is_bad_point():
+                    bad_points += 1
+                    continue
+                
+                observations_count = map_point.get_observations_count()
+                if observations_count > 0:
+                    tracked_count += 1
+                else:
+                    zero_observations += 1
             
+            rospy.loginfo(f"  📊 get_tracked_feature_count: total={total_map_points}, tracked={tracked_count}, bad={bad_points}, zero_obs={zero_observations}")
             return tracked_count
             
         except Exception as e:
@@ -1289,6 +1353,7 @@ class SLAMSystem:
             quality: Tracking quality score (0-1, higher is better)
         """
         if self.reference_keyframe is None:
+            rospy.loginfo("  📊 compute_tracking_quality: No reference keyframe")
             return 0.0
         
         try:
@@ -1311,6 +1376,7 @@ class SLAMSystem:
             quality = (visibility_ratio * 0.6 + 
                       min(feature_density / 100.0, 1.0) * 0.4)
             
+            rospy.loginfo(f"  📊 compute_tracking_quality: tracked={tracked_features}, total={total_map_points}, visibility={visibility_ratio:.3f}, density={feature_density:.1f}, quality={quality:.3f}")
             return quality
             
         except Exception as e:
@@ -1482,9 +1548,11 @@ class SLAMSystem:
                     rospy.loginfo("  ⏭️  Frame window too small, skipping BA")
                 
                 rospy.loginfo("  🔄 About to cull map points...")
+                map_points_before = len(self.map.get_map_points())
                 # Cull bad map points
-                self.map.cull_map_points()
-                rospy.loginfo("  ✅ Map points culled")
+                self.map.cull_map_points(max_observations=1, max_age=5)  # Less aggressive culling
+                map_points_after = len(self.map.get_map_points())
+                rospy.loginfo(f"  ✅ Map points culled: {map_points_before} -> {map_points_after} (removed {map_points_before - map_points_after})")
                 
                 rospy.loginfo("  😴 Sleeping for 2 seconds...")
                 # Sleep for bundle adjustment (0.5 Hz - every 2 seconds)
@@ -1526,9 +1594,9 @@ class SLAMSystem:
         
         # Check if enough time has passed since last bundle adjustment
         current_time = time.time()
-        if hasattr(self, '_last_ba_time') and current_time - self._last_ba_time < 10.0:  # Increased to 10 seconds
-            rospy.loginfo("  ⏭️  Not enough time since last BA, returning None")
-            return None  # Skip if less than 10 seconds since last BA
+        # if hasattr(self, '_last_ba_time') and current_time - self._last_ba_time < 5.0:  # Reduced to 5 seconds
+        #     rospy.loginfo("  ⏭️  Not enough time since last BA, returning None")
+        #     return None  # Skip if less than 5 seconds since last BA
         
         rospy.loginfo("  ✅ Setting ba_running = True")
         self.ba_running = True
@@ -1541,7 +1609,7 @@ class SLAMSystem:
                 return None
             
             # Skip bundle adjustment if too many frames (can be slow)
-            if len(frame_window) > 8:  # Limit to 8 frames
+            if len(frame_window) > 10:  # Limit to 10 frames
                 rospy.logwarn(f"Too many frames ({len(frame_window)}), skipping bundle adjustment")
                 return None
             
@@ -1657,8 +1725,13 @@ class SLAMSystem:
                 return None
             
             # Skip if too many observations (can be slow)
-            if len(observations_list) > 2000:  # Limit observations for speed
+            if len(observations_list) > 500:  # Limit observations to prevent memory issues
                 rospy.logwarn(f"Too many observations ({len(observations_list)}), skipping bundle adjustment")
+                return None
+            
+            # Skip if too many 3D points (can cause memory issues)
+            if len(points_3d) > 200:  # Limit 3D points to prevent memory issues
+                rospy.logwarn(f"Too many 3D points ({len(points_3d)}), skipping bundle adjustment")
                 return None
             
             # Flatten optimization variables
@@ -1837,8 +1910,8 @@ class SLAMSystem:
             processed_obs += 1
             
             # Print progress every 100 observations
-            if processed_obs % 100 == 0:
-                rospy.loginfo(f"    Reprojection error: processed {processed_obs}/{len(observations)} observations")
+            # if processed_obs % 100 == 0:
+            #     rospy.loginfo(f"    Reprojection error: processed {processed_obs}/{len(observations)} observations")
         
         rospy.loginfo(f"    Reprojection error: completed {processed_obs} observations, returning {len(errors)} errors")
         return np.array(errors)
