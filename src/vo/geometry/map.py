@@ -59,19 +59,19 @@ class Map:
         Args:
             map_point_id: ID of the map point to remove
         """
-        with self.lock:
-            if map_point_id in self.map_points:
-                map_point = self.map_points[map_point_id]
-                
-                # Remove observations from keyframes
-                observations = map_point.get_observations()
-                for keyframe_id, feature_id in observations.items():
-                    if keyframe_id in self.keyframes:
-                        self.keyframes[keyframe_id].remove_map_point(feature_id)
-                
-                # Mark map point as bad
-                map_point.set_bad()
-                del self.map_points[map_point_id]
+        # Note: This method should be called while the map lock is already held
+        if map_point_id in self.map_points:
+            map_point = self.map_points[map_point_id]
+            
+            # Remove observations from keyframes
+            observations = map_point.get_observations()
+            for keyframe_id, feature_id in observations.items():
+                if keyframe_id in self.keyframes:
+                    self.keyframes[keyframe_id].remove_map_point(feature_id)
+            
+            # Mark map point as bad
+            map_point.set_bad()
+            del self.map_points[map_point_id]
     
     def remove_keyframe(self, keyframe_id):
         """
@@ -170,7 +170,11 @@ class Map:
             max_observations: Maximum number of observations for a point to be considered bad
             max_age: Maximum age (in frames) for a point to be considered bad
         """
+        import rospy
+        rospy.loginfo("  🔍 Starting map point culling...")
+        
         with self.lock:
+            rospy.loginfo(f"  🔍 Acquired map lock, processing {len(self.map_points)} map points")
             map_points_to_remove = []
             
             for map_point_id, map_point in self.map_points.items():
@@ -190,9 +194,14 @@ class Map:
                 if observations_count < 3 and len(map_point.get_observations()) < 2:
                     map_points_to_remove.append(map_point_id)
             
+            rospy.loginfo(f"  🔍 Found {len(map_points_to_remove)} map points to remove")
+            
             # Remove bad map points
-            for map_point_id in map_points_to_remove:
+            for i, map_point_id in enumerate(map_points_to_remove):
+                # rospy.loginfo(f"  🔍 Removing map point {i+1}/{len(map_points_to_remove)}: ID {map_point_id}")
                 self.remove_map_point(map_point_id)
+            
+            rospy.loginfo("  🔍 Map point culling completed")
     
     def get_recent_keyframes(self, n=10):
         """

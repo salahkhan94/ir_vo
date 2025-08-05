@@ -49,9 +49,10 @@ class SLAMSystem:
         self.current_frame_id = 0
         self.last_keyframe_id = 0
         # Keyframe selection parameters
-        self.keyframe_interval = 10  # Create keyframe every N frames (fallback)
-        self.min_translation = 0.1  # Minimum translation distance (meters)
-        self.min_rotation = 0.1  # Minimum rotation angle (radians, ~5.7 degrees)
+        self.keyframe_interval = 5  # Create keyframe every N frames (fallback) - reduced for more frequent keyframes
+        self.min_keyframe_interval = 3  # Minimum frames between keyframes
+        self.min_translation = 0.5  # Minimum translation distance (meters) - increased for more selective keyframe selection
+        self.min_rotation = 0.2  # Minimum rotation angle (radians, ~11.5 degrees) - increased for more selective keyframe selection
         self.min_tracking_quality = 0.7  # Minimum tracking quality threshold
         self.min_tracked_features = 50  # Minimum number of tracked features
         self.max_reprojection_error = 2.0  # Maximum acceptable reprojection error (pixels)
@@ -77,6 +78,7 @@ class SLAMSystem:
         # Bundle adjustment parameters
         self.ba_window_size = 10  # Number of recent frames for BA
         self.ba_running = False
+        self._last_ba_time = 0.0  # Initialize to 0 so BA can run immediately
         
         # Tracking failure handling
         self.tracking_failure_count = 0
@@ -87,9 +89,14 @@ class SLAMSystem:
         
         # Path history for trajectory visualization
         self.path_history = []
+        self.path_keyframe_mapping = {}  # Maps path index to keyframe_id
+        
+        # Sliding window for bundle adjustment (last 10 frames)
+        self.frame_window = []  # List of (frame_id, pose, keypoints, descriptors) tuples
+        self.max_frame_window = 10  # Maximum number of frames in sliding window
         
         # Initialize mapping thread
-        # self.start_mapping_thread()  # Commented out to focus on tracking only
+        self.start_mapping_thread()  # Enable bundle adjustment thread
     
     def start_mapping_thread(self):
         """Start the mapping thread for bundle adjustment."""
@@ -227,7 +234,17 @@ class SLAMSystem:
         if success:
             rospy.loginfo("Tracking successful, updating state to OK")
             self.tracking_state = "OK"
-            self.current_pose = pose
+            
+            # Validate pose before setting current_pose
+            if pose is not None and pose.shape == (4, 4):
+                self.current_pose = pose  # track_frame now returns global pose directly
+                
+                # Add frame to sliding window for bundle adjustment
+                self.add_frame_to_window(self.current_frame_id, pose, keypoints, descriptors)
+            else:
+                rospy.logwarn(f"Invalid pose shape from track_frame: {pose.shape if pose is not None else 'None'}")
+                return False, None
+                
             self.tracking_failure_count = 0  # Reset failure counter
             
             # Check if we should create a new keyframe
@@ -248,7 +265,7 @@ class SLAMSystem:
                     thread = threading.Thread(target=create_keyframe_thread)
                     thread.daemon = True
                     thread.start()
-                    thread.join(timeout=0.5)  # 500ms timeout
+                    thread.join(timeout=2.0)  # 2 second timeout for keyframe creation
                     
                     if thread.is_alive():
                         rospy.logwarn("Keyframe creation timed out, skipping for this frame")
@@ -272,6 +289,30 @@ class SLAMSystem:
         self.current_frame_id += 1
         return success, self.current_pose
     
+    def add_frame_to_window(self, frame_id, pose, keypoints, descriptors):
+        """
+        Add a frame to the sliding window for bundle adjustment.
+        
+        Args:
+            frame_id: Frame ID
+            pose: Camera pose (4x4 matrix)
+            keypoints: Detected keypoints
+            descriptors: Feature descriptors
+        """
+        # Add frame to window
+        frame_data = {
+            'frame_id': frame_id,
+            'pose': pose.copy(),
+            'keypoints': keypoints,
+            'descriptors': descriptors.copy() if descriptors is not None else None
+        }
+        
+        self.frame_window.append(frame_data)
+        
+        # Keep only the last max_frame_window frames
+        if len(self.frame_window) > self.max_frame_window:
+            self.frame_window.pop(0)  # Remove oldest frame
+    
     def get_current_keypoints(self):
         """
         Get the keypoints from the most recent frame processing.
@@ -283,7 +324,7 @@ class SLAMSystem:
     
     def track_frame(self, frame, keypoints, descriptors, K, header):
         """
-        Track the current frame using PnP.
+        Track the current frame using 2D-2D correspondences and Essential matrix.
         
         Args:
             frame: Current frame
@@ -294,7 +335,7 @@ class SLAMSystem:
             
         Returns:
             success: Whether tracking was successful
-            pose: Estimated pose
+            pose: Estimated pose (global pose in world coordinates)
         """
         if self.reference_keyframe is None:
             rospy.logwarn("No reference keyframe available")
@@ -306,12 +347,10 @@ class SLAMSystem:
             self.debug_pub.publish(debug_msg)
             return False, None
         
-        # Get all map points from the system
-        all_map_points = self.map.get_map_points()
-        rospy.loginfo(f"System has {len(all_map_points)} total map points")
-        
-        # Get descriptors from reference keyframe for matching
+        # Get keypoints and descriptors from reference keyframe
+        ref_keypoints = self.reference_keyframe.get_keypoints()
         ref_descriptors = self.reference_keyframe.get_descriptors()
+        
         if ref_descriptors is None:
             rospy.logwarn("No descriptors in reference keyframe")
             return False, None
@@ -324,117 +363,91 @@ class SLAMSystem:
         debug_msg = f"Frame {self.current_frame_id}: {len(good_matches)}/{len(matches)} matches, State: {self.tracking_state}"
         self.debug_pub.publish(debug_msg)
         
-        # Adaptive threshold based on number of matches
-        min_matches = max(5, min(15, len(good_matches) // 5))  # Ensure at least 5, but be more lenient
+        # Check minimum matches
+        min_matches = max(8, min(20, len(good_matches) // 3))  # Ensure at least 8 matches
         if len(good_matches) < min_matches:
             rospy.logwarn(f"Not enough good matches: {len(good_matches)} < {min_matches}")
             debug_msg = f"Frame {self.current_frame_id}: Insufficient matches ({len(good_matches)}/{min_matches}), State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
             return False, None
         
-        # Prepare 3D-2D correspondences for PnP
-        points_3d = []
-        points_2d = []
-        bad_points_count = 0
-        no_map_point_count = 0
+        # Extract 2D-2D correspondences
+        pts1, pts2 = get_matched_points(ref_keypoints, keypoints, good_matches)
         
-        for match in good_matches:
-            ref_feature_id = match.queryIdx
-            curr_feature_id = match.trainIdx
-            
-            # Try to get map point from reference keyframe first
-            map_point = self.reference_keyframe.get_map_point(ref_feature_id)
-            if map_point is not None and not map_point.is_bad_point():
-                point_3d = map_point.get_position()
-                point_2d = keypoints[curr_feature_id].pt
-                
-                points_3d.append(point_3d)
-                points_2d.append(point_2d)
-            elif map_point is not None:
-                bad_points_count += 1
-            else:
-                no_map_point_count += 1
+        # Estimate Essential Matrix
+        E, E_mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.5)
         
-        rospy.loginfo(f"3D-2D correspondences: {len(points_3d)} valid, {bad_points_count} bad map points, {no_map_point_count} no map point")
-        
-        # More detailed debugging
-        if len(points_3d) < 10:  # If we have very few correspondences, debug in detail
-            rospy.logwarn(f"DEBUG: Only {len(points_3d)} valid 3D-2D correspondences from {len(good_matches)} good matches")
-            rospy.logwarn(f"DEBUG: Bad map points: {bad_points_count}, No map point: {no_map_point_count}")
-            
-            # Check a few specific matches to understand the issue
-            for i, match in enumerate(good_matches[:5]):  # Check first 5 matches
-                ref_feature_id = match.queryIdx
-                map_point = self.reference_keyframe.get_map_point(ref_feature_id)
-                if map_point is not None:
-                    rospy.logwarn(f"DEBUG: Match {i}: Feature {ref_feature_id} has map point, bad={map_point.is_bad_point()}")
-                else:
-                    rospy.logwarn(f"DEBUG: Match {i}: Feature {ref_feature_id} has NO map point")
-        else:
-            # Even when we have enough correspondences, check why some matches don't have map points
-            if no_map_point_count > 0:
-                rospy.logwarn(f"DEBUG: {no_map_point_count} matches have no map points out of {len(good_matches)} total matches")
-                # Check a few random matches that don't have map points
-                no_map_point_features = []
-                for match in good_matches:
-                    ref_feature_id = match.queryIdx
-                    if not self.reference_keyframe.has_map_point(ref_feature_id):
-                        no_map_point_features.append(ref_feature_id)
-                        if len(no_map_point_features) >= 5:  # Show first 5
-                            break
-                rospy.logwarn(f"DEBUG: Features without map points: {no_map_point_features}")
-        
-        min_correspondences = max(4, min(10, len(points_3d) // 5))  # Ensure at least 4, but be more lenient
-        if len(points_3d) < min_correspondences:
-            rospy.logwarn(f"Not enough 3D-2D correspondences: {len(points_3d)} < {min_correspondences}")
-            debug_msg = f"Frame {self.current_frame_id}: Insufficient 3D-2D correspondences ({len(points_3d)}/{min_correspondences}), State: {self.tracking_state}"
+        if E is None:
+            rospy.logwarn("Failed to estimate Essential Matrix")
+            debug_msg = f"Frame {self.current_frame_id}: Essential Matrix estimation failed, State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
             return False, None
         
-        rospy.loginfo(f"Using {len(points_3d)} 3D-2D correspondences for PnP")
-        points_3d = np.array(points_3d, dtype=np.float32)
-        points_2d = np.array(points_2d, dtype=np.float32)
+        # Count inliers from Essential Matrix
+        E_inliers = np.sum(E_mask)
+        rospy.loginfo(f"Essential Matrix inliers: {E_inliers}/{len(good_matches)}")
         
-        # Ensure we have at least 4 points for PnP
-        if len(points_3d) < 4:
-            rospy.logwarn(f"Not enough 3D-2D correspondences for PnP: {len(points_3d)} < 4")
-            debug_msg = f"Frame {self.current_frame_id}: Insufficient 3D-2D correspondences for PnP ({len(points_3d)} < 4), State: {self.tracking_state}"
+        min_inliers = max(8, min(15, len(good_matches) // 4))  # Ensure at least 8 inliers
+        if E_inliers < min_inliers:
+            rospy.logwarn(f"Not enough Essential Matrix inliers: {E_inliers} < {min_inliers}")
+            debug_msg = f"Frame {self.current_frame_id}: Insufficient Essential Matrix inliers ({E_inliers}/{min_inliers}), State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
             return False, None
         
-        # Use RANSAC PnP
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            points_3d, points_2d, K, None,
-            flags=cv2.SOLVEPNP_ITERATIVE,
-            reprojectionError=2.0,
-            confidence=0.99,
-            iterationsCount=100
-        )
-
-        min_inliers = max(3, min(8, len(points_3d) // 10))  # More lenient: max 8 instead of 10, min 3
-        if not success or len(inliers) < min_inliers:
-            rospy.logwarn(f"PnP failed or not enough inliers: success={success}, inliers={len(inliers) if inliers is not None else 0}, required={min_inliers}")
-            debug_msg = f"Frame {self.current_frame_id}: PnP failed (success={success}, inliers={len(inliers) if inliers is not None else 0}/{min_inliers}), State: {self.tracking_state}"
+        # Filter points using Essential Matrix mask
+        inlier_pts1 = pts1[E_mask.ravel() == 1]
+        inlier_pts2 = pts2[E_mask.ravel() == 1]
+        
+        # Recover pose from Essential Matrix
+        retval, R, t, pose_mask = cv2.recoverPose(E, inlier_pts1, inlier_pts2, K)
+        
+        if R is None or t is None:
+            rospy.logwarn("Failed to recover pose from Essential Matrix")
+            debug_msg = f"Frame {self.current_frame_id}: Pose recovery failed, State: {self.tracking_state}"
             self.debug_pub.publish(debug_msg)
             return False, None
-        else:
-            rospy.loginfo(f"PnP success: {success}, inliers: {len(inliers)}")
-        # Convert to pose matrix
-        R, _ = cv2.Rodrigues(rvec)
-        pose = np.eye(4)
-        pose[:3, :3] = R
-        pose[:3, 3] = tvec.flatten()
         
-        # Publish pose and transform
-        rospy.loginfo(f"Publishing pose: [{pose[0,3]:.2f}, {pose[1,3]:.2f}, {pose[2,3]:.2f}]")
-        self.publish_pose(pose, header)
-        self.publish_path(pose, header)
+        # Count inliers from pose recovery
+        pose_inliers = np.sum(pose_mask)
+        rospy.loginfo(f"Pose recovery inliers: {pose_inliers}/{len(inlier_pts1)}")
+        
+        if pose_inliers < min_inliers:
+            rospy.logwarn(f"Not enough pose recovery inliers: {pose_inliers} < {min_inliers}")
+            debug_msg = f"Frame {self.current_frame_id}: Insufficient pose recovery inliers ({pose_inliers}/{min_inliers}), State: {self.tracking_state}"
+            self.debug_pub.publish(debug_msg)
+            return False, None
+        
+        # Construct relative pose matrix
+        relative_pose = np.eye(4)
+        relative_pose[:3, :3] = R
+        relative_pose[:3, 3] = t.flatten()
+        
+        # Get reference keyframe pose (global pose)
+        reference_pose = self.reference_keyframe.get_pose()
+        
+        # Validate reference pose
+        if reference_pose is None or reference_pose.shape != (4, 4):
+            rospy.logwarn(f"Invalid reference pose shape: {reference_pose.shape if reference_pose is not None else 'None'}")
+            return False, None
+        
+        # Compute global pose by composing reference pose with relative pose
+        global_pose = reference_pose @ relative_pose
+        
+        # Validate global pose
+        if global_pose.shape != (4, 4):
+            rospy.logwarn(f"Invalid global pose shape: {global_pose.shape}")
+            return False, None
+        
+        # Publish global pose and transform
+        rospy.loginfo(f"Publishing global pose: [{global_pose[0,3]:.2f}, {global_pose[1,3]:.2f}, {global_pose[2,3]:.2f}]")
+        self.publish_pose(global_pose, header)
+        self.publish_path(global_pose, header)
         
         # Publish success debug information
-        debug_msg = f"Frame {self.current_frame_id}: Tracking SUCCESS! Pose: [{pose[0,3]:.2f}, {pose[1,3]:.2f}, {pose[2,3]:.2f}], State: {self.tracking_state}"
+        debug_msg = f"Frame {self.current_frame_id}: Tracking SUCCESS! Global Pose: [{global_pose[0,3]:.2f}, {global_pose[1,3]:.2f}, {global_pose[2,3]:.2f}], State: {self.tracking_state}"
         self.debug_pub.publish(debug_msg)
         
-        return True, pose
+        return True, global_pose
     
     def create_keyframe(self, frame, keypoints, descriptors, K, header):
         """
@@ -460,6 +473,11 @@ class SLAMSystem:
         rospy.loginfo("Successfully acquired map mutex for keyframe creation")
             
         try:
+            # Validate current pose before creating keyframe
+            if self.current_pose is None or self.current_pose.shape != (4, 4):
+                rospy.logwarn(f"Invalid current pose for keyframe creation: {self.current_pose.shape if self.current_pose is not None else 'None'}")
+                return None
+            
             # Create keyframe
             rospy.loginfo("Instantiating KeyFrame object...")
             keyframe = KeyFrame(
@@ -756,7 +774,11 @@ class SLAMSystem:
             rospy.loginfo(f"Pose recovered from Homography: R={R}, t={t}")
             
             # 2. Triangulate 3D points
-            points_3d = self.triangulate_points(pts1, pts2, np.eye(4), np.hstack([R, t]), K)
+            # Create proper 4x4 pose matrix for triangulation
+            pose2 = np.eye(4)
+            pose2[:3, :3] = R
+            pose2[:3, 3] = t.flatten()
+            points_3d = self.triangulate_points(pts1, pts2, np.eye(4), pose2, K)
             
             if points_3d is None or len(points_3d) == 0:
                 rospy.logwarn("Triangulation failed with Homography")
@@ -775,10 +797,15 @@ class SLAMSystem:
                 camera_matrix=K
             )
             
+            # Create proper 4x4 pose matrix for second keyframe
+            pose2 = np.eye(4)
+            pose2[:3, :3] = R
+            pose2[:3, 3] = t.flatten()
+            
             keyframe2 = KeyFrame(
                 frame_id=self.current_frame_id,
                 timestamp=0.0,
-                pose=np.hstack([R, t]),
+                pose=pose2,
                 keypoints=keypoints2,
                 descriptors=descriptors2,
                 camera_matrix=K
@@ -800,7 +827,8 @@ class SLAMSystem:
             for i, (match, point_3d) in enumerate(zip(matches, points_3d)):
                 if mask[i, 0]:  # This point is an inlier
                     # Check if the triangulated point is valid
-                    if point_3d[2] > 0.1 and point_3d[2] < 100.0:  # Depth between 0.1m and 100m
+                    # For KITTI dataset, depths can be much larger (500-600m is normal)
+                    if point_3d[2] > 0.1 and point_3d[2] < 1000.0:  # Depth between 0.1m and 1000m
                         inlier_matches.append(match)
                         inlier_points_3d.append(point_3d)
             
@@ -853,7 +881,11 @@ class SLAMSystem:
             rospy.loginfo(f"Pose recovered from Fundamental Matrix: R={R}, t={t}")
             
             # 2. Triangulate 3D points
-            points_3d = self.triangulate_points(pts1, pts2, np.eye(4), np.hstack([R, t]), K)
+            # Create proper 4x4 pose matrix for triangulation
+            pose2 = np.eye(4)
+            pose2[:3, :3] = R
+            pose2[:3, 3] = t.flatten()
+            points_3d = self.triangulate_points(pts1, pts2, np.eye(4), pose2, K)
             
             if points_3d is None or len(points_3d) == 0:
                 rospy.logwarn("Triangulation failed with Fundamental Matrix")
@@ -872,10 +904,15 @@ class SLAMSystem:
                 camera_matrix=K
             )
             
+            # Create proper 4x4 pose matrix for second keyframe
+            pose2 = np.eye(4)
+            pose2[:3, :3] = R
+            pose2[:3, 3] = t.flatten()
+            
             keyframe2 = KeyFrame(
                 frame_id=self.current_frame_id,
                 timestamp=0.0,
-                pose=np.hstack([R, t]),
+                pose=pose2,
                 keypoints=keypoints2,
                 descriptors=descriptors2,
                 camera_matrix=K
@@ -897,7 +934,8 @@ class SLAMSystem:
             for i, (match, point_3d) in enumerate(zip(matches, points_3d)):
                 if mask[i, 0]:  # This point is an inlier
                     # Check if the triangulated point is valid
-                    if point_3d[2] > 0.1 and point_3d[2] < 100.0:  # Depth between 0.1m and 100m
+                    # For KITTI dataset, depths can be much larger (500-600m is normal)
+                    if point_3d[2] > 0.1 and point_3d[2] < 1000.0:  # Depth between 0.1m and 1000m
                         inlier_matches.append(match)
                         inlier_points_3d.append(point_3d)
             
@@ -994,10 +1032,18 @@ class SLAMSystem:
             return
         
         # Create map points for the triangulated 3D points
+        # Limit the number of new map points to avoid overwhelming the system
+        max_new_map_points = 500  # Limit to 500 new map points per keyframe
         new_map_points = 0
+        
         for i, (match, point_3d) in enumerate(zip(good_matches, points_3d)):
+            # Stop if we've reached the limit
+            if new_map_points >= max_new_map_points:
+                break
+                
             # Check if point is valid (positive depth, reasonable distance)
-            if point_3d[2] > 0.1 and point_3d[2] < 100.0:  # Depth between 0.1m and 100m
+            # For KITTI dataset, depths can be much larger (500-600m is normal)
+            if point_3d[2] > 0.1 and point_3d[2] < 1000.0:  # Depth between 0.1m and 1000m
                 # Create map point
                 map_point = MapPoint(point_3d, keyframe.frame_id, match.trainIdx)
                 map_point_id = self.map.add_map_point(map_point)
@@ -1014,10 +1060,10 @@ class SLAMSystem:
                 #     rospy.loginfo(f"DEBUG: Reference keyframe already has map point for feature {ref_feature_id}")
                 
                 new_map_points += 1
-            else:
-                rospy.logwarn(f"DEBUG: Invalid 3D point {i}: depth={point_3d[2]:.2f}")
+            # else:
+            #     rospy.logwarn(f"DEBUG: Invalid 3D point {i}: depth={point_3d[2]:.2f}")
         
-        rospy.loginfo(f"Created {new_map_points} new map points from triangulation")
+        rospy.loginfo(f"Created {new_map_points} new map points from triangulation (limited to {max_new_map_points})")
         
         # Publish debug information about new map points
         debug_msg = f"Frame {self.current_frame_id}: Created {new_map_points} new map points, Total map points: {len(self.map.map_points)}"
@@ -1084,19 +1130,26 @@ class SLAMSystem:
         # 2. Check tracking quality criteria
         tracking_criteria = self.check_tracking_quality_criteria()
         
-        # 3. Fallback to fixed interval if no other criteria met
+        # 3. Check minimum interval between keyframes
+        min_interval_ok = (self.current_frame_id - self.last_keyframe_id) >= self.min_keyframe_interval
+        
+        # 4. Fallback to fixed interval if no other criteria met
         interval_criteria = (self.current_frame_id - self.last_keyframe_id) >= self.keyframe_interval
         
-        # Create keyframe if any criteria are met
-        should_create = motion_criteria or tracking_criteria or interval_criteria
+        # Create keyframe if motion/tracking criteria are met AND minimum interval is satisfied
+        should_create = (motion_criteria or tracking_criteria or interval_criteria) and min_interval_ok
         
         if should_create:
             rospy.loginfo(f"🎯 KEYFRAME SELECTED! Frame {self.current_frame_id}")
             rospy.loginfo(f"   └─ Motion criteria: {motion_criteria}")
             rospy.loginfo(f"   └─ Tracking criteria: {tracking_criteria}")
             rospy.loginfo(f"   └─ Interval criteria: {interval_criteria}")
+            rospy.loginfo(f"   └─ Min interval check: {min_interval_ok} (frames since last: {self.current_frame_id - self.last_keyframe_id})")
         else:
-            rospy.loginfo(f"⏭️  No keyframe selected for frame {self.current_frame_id}")
+            if not min_interval_ok:
+                rospy.loginfo(f"⏭️  No keyframe selected for frame {self.current_frame_id} - minimum interval not satisfied ({self.current_frame_id - self.last_keyframe_id} < {self.min_keyframe_interval})")
+            else:
+                rospy.loginfo(f"⏭️  No keyframe selected for frame {self.current_frame_id}")
         
         return should_create
     
@@ -1110,25 +1163,25 @@ class SLAMSystem:
         if self.reference_keyframe is None:
             return False
         
-        # Get current pose and last keyframe pose
+        # Get current pose and reference keyframe pose (not last keyframe pose)
         current_pose = self.current_pose
-        last_keyframe_pose = self.last_keyframe_pose
+        reference_pose = self.reference_keyframe.get_pose()
         
         # Validate pose matrices
-        if (current_pose is None or last_keyframe_pose is None or
-            current_pose.shape != (4, 4) or last_keyframe_pose.shape != (4, 4)):
+        if (current_pose is None or reference_pose is None or
+            current_pose.shape != (4, 4) or reference_pose.shape != (4, 4)):
             rospy.logwarn("Invalid pose matrices for motion criteria check")
             return False
         
         # Check if matrices are valid (not all zeros, proper structure)
-        if (np.allclose(current_pose, 0) or np.allclose(last_keyframe_pose, 0) or
-            np.allclose(current_pose, np.eye(4)) and np.allclose(last_keyframe_pose, np.eye(4))):
+        if (np.allclose(current_pose, 0) or np.allclose(reference_pose, 0) or
+            np.allclose(current_pose, np.eye(4)) and np.allclose(reference_pose, np.eye(4))):
             rospy.logwarn("Pose matrices are invalid (all zeros or identity) for motion check")
             return False
         
         try:
-            # Compute relative transformation
-            relative_pose = np.linalg.inv(last_keyframe_pose) @ current_pose
+            # Compute relative transformation from reference keyframe to current pose
+            relative_pose = np.linalg.inv(reference_pose) @ current_pose
             
             # Extract translation and rotation
             translation = relative_pose[:3, 3]
@@ -1144,6 +1197,8 @@ class SLAMSystem:
             
             if translation_ok or rotation_ok:
                 rospy.loginfo(f"🚀 Motion criteria met: translation={translation_distance:.3f}m (threshold: {self.min_translation}m), rotation={rotation_angle:.3f}rad (threshold: {self.min_rotation}rad)")
+            else:
+                rospy.loginfo(f"📏 Motion criteria not met: translation={translation_distance:.3f}m (threshold: {self.min_translation}m), rotation={rotation_angle:.3f}rad (threshold: {self.min_rotation}rad)")
             
             return translation_ok or rotation_ok
             
@@ -1300,6 +1355,10 @@ class SLAMSystem:
                         
                         # Clear path history for fresh trajectory
                         self.path_history = []
+                        self.path_keyframe_mapping = {}
+                        
+                        # Clear frame window
+                        self.frame_window = []
                         
                         # Clear previous frame data for fresh initialization
                         if hasattr(self, '_reference_frame'):
@@ -1329,6 +1388,10 @@ class SLAMSystem:
                     
                     # Clear path history for fresh trajectory
                     self.path_history = []
+                    self.path_keyframe_mapping = {}
+                    
+                    # Clear frame window
+                    self.frame_window = []
                     
                     # Try to create a simple keyframe without map operations
                     rospy.loginfo("Creating simple keyframe for reinitialization...")
@@ -1349,6 +1412,8 @@ class SLAMSystem:
                 self.current_pose = np.eye(4)
                 self.reference_keyframe = None
                 self.path_history = []
+                self.path_keyframe_mapping = {}
+                self.frame_window = []
             finally:
                 # Resume mapping thread
                 self.reinitializing = False
@@ -1373,178 +1438,446 @@ class SLAMSystem:
     def mapping_loop(self):
         """
         Main loop for the mapping thread.
-        Performs bundle adjustment on recent keyframes.
+        Performs bundle adjustment on last 10 frames and updates path.
         """
+        rospy.loginfo("Mapping thread started")
+        
         while self.mapping_running:
             try:
+                rospy.loginfo("=== MAPPING LOOP ITERATION START ===")
+                
                 # Skip bundle adjustment if reinitializing
                 if self.reinitializing:
+                    rospy.loginfo("  Skipping BA - reinitializing")
                     time.sleep(0.1)
                     continue
                 
-                # Get recent keyframes for bundle adjustment
-                recent_keyframes = self.map.get_recent_keyframes(self.ba_window_size)
+                rospy.loginfo(f"  Frame window size: {len(self.frame_window)}")
                 
-                if len(recent_keyframes) >= 2:
-                    # Perform bundle adjustment
-                    self.perform_bundle_adjustment(recent_keyframes)
+                # Get last 10 frames for bundle adjustment
+                if len(self.frame_window) >= 2:
+                    rospy.loginfo(f"  ✅ Frame window has {len(self.frame_window)} frames, proceeding with BA")
+                    rospy.loginfo(f"Performing bundle adjustment on {len(self.frame_window)} frames")
+                    
+                    try:
+                        rospy.loginfo("  🔄 About to call perform_bundle_adjustment_on_frames...")
+                        # Perform bundle adjustment on frame window
+                        optimized_poses = self.perform_bundle_adjustment_on_frames(self.frame_window)
+                        rospy.loginfo("  ✅ perform_bundle_adjustment_on_frames completed")
+                        
+                        # Update path with optimized poses
+                        if optimized_poses:
+                            rospy.loginfo("  🔄 Updating path with optimized poses...")
+                            self.update_path_with_optimized_poses(optimized_poses)
+                            rospy.loginfo("  ✅ Path updated successfully")
+                        else:
+                            rospy.loginfo("  ⚠️  No optimized poses returned from BA")
+                    except Exception as e:
+                        rospy.logerr(f"Bundle adjustment failed: {e}")
+                        rospy.logerr(f"Exception type: {type(e).__name__}")
+                        import traceback
+                        rospy.logerr(f"Traceback: {traceback.format_exc()}")
+                        # Continue without bundle adjustment
+                else:
+                    rospy.loginfo("  ⏭️  Frame window too small, skipping BA")
                 
+                rospy.loginfo("  🔄 About to cull map points...")
                 # Cull bad map points
                 self.map.cull_map_points()
+                rospy.loginfo("  ✅ Map points culled")
                 
-                # Sleep for a longer time to reduce contention
-                time.sleep(0.5)
+                rospy.loginfo("  😴 Sleeping for 2 seconds...")
+                # Sleep for bundle adjustment (0.5 Hz - every 2 seconds)
+                time.sleep(2.0)
+                rospy.loginfo("  ✅ Woke up from sleep")
+                
+                # Add a timeout check to prevent getting stuck
+                if hasattr(self, '_last_ba_time'):
+                    if time.time() - self._last_ba_time > 30:  # 30 second timeout
+                        rospy.logwarn("Bundle adjustment timeout, resetting")
+                        self.ba_running = False
+                        # Don't reset _last_ba_time here - only reset when BA actually runs
+                # Don't set _last_ba_time here - only set it when BA actually runs
+                
+                rospy.loginfo("=== MAPPING LOOP ITERATION END ===")
                 
             except Exception as e:
                 rospy.logerr(f"Error in mapping thread: {e}")
+                rospy.logerr(f"Exception type: {type(e).__name__}")
+                import traceback
+                rospy.logerr(f"Traceback: {traceback.format_exc()}")
                 time.sleep(0.5)
     
-    def perform_bundle_adjustment(self, keyframes):
+    def perform_bundle_adjustment_on_frames(self, frame_window):
         """
-        Perform bundle adjustment on the given keyframes.
+        Perform bundle adjustment on the given frame window.
         
         Args:
-            keyframes: List of KeyFrame objects to optimize
+            frame_window: List of frame data dictionaries
+            
+        Returns:
+            optimized_poses: Dictionary mapping frame_id to optimized pose, or None if failed
         """
-        if self.ba_running:
-            return
+        rospy.loginfo("🚀 ENTERING perform_bundle_adjustment_on_frames")
         
+        if self.ba_running:
+            rospy.loginfo("  ⏭️  BA already running, returning None")
+            return None
+        
+        # Check if enough time has passed since last bundle adjustment
+        current_time = time.time()
+        if hasattr(self, '_last_ba_time') and current_time - self._last_ba_time < 10.0:  # Increased to 10 seconds
+            rospy.loginfo("  ⏭️  Not enough time since last BA, returning None")
+            return None  # Skip if less than 10 seconds since last BA
+        
+        rospy.loginfo("  ✅ Setting ba_running = True")
         self.ba_running = True
         
         try:
-            # Get observations for optimization
-            keyframe_ids = [kf.frame_id for kf in keyframes]
-            observations = self.map.get_observations_for_optimization(keyframe_ids)
+            # Create observations from frame window for full bundle adjustment
+            # We need to triangulate 3D points between frames and create observations
             
-            if len(observations) < 2:
-                return
+            if len(frame_window) < 2:
+                return None
+            
+            # Skip bundle adjustment if too many frames (can be slow)
+            if len(frame_window) > 8:  # Limit to 8 frames
+                rospy.logwarn(f"Too many frames ({len(frame_window)}), skipping bundle adjustment")
+                return None
             
             # Prepare optimization variables
             poses = []
-            points_3d = []
+            valid_frames = []
+            
+            # Collect poses from frame window
+            for frame_data in frame_window:
+                pose = frame_data['pose']
+                # Ensure pose is a 4x4 numpy array
+                if pose is not None:
+                    pose_array = np.array(pose, dtype=np.float64)
+                    if pose_array.shape == (4, 4):
+                        poses.append(pose_array)
+                        valid_frames.append(frame_data)
+                    else:
+                        rospy.logwarn(f"Invalid pose shape: {pose_array.shape}, skipping frame {frame_data['frame_id']}")
+                        continue
+                else:
+                    rospy.logwarn(f"None pose for frame {frame_data['frame_id']}, skipping")
+                    continue
+            
+            if len(poses) == 0:
+                rospy.logwarn("No valid poses for bundle adjustment")
+                return None
+            
+            rospy.loginfo("=== STARTING FULL BUNDLE ADJUSTMENT ===")
+            
+            # Create observations from feature correspondences between frames
+            rospy.loginfo("Step 1: Creating observations from feature correspondences...")
             observations_list = []
-            
-            # Collect poses and 3D points
-            for keyframe in keyframes:
-                poses.append(keyframe.get_pose())
-            
-            # Collect 3D points and observations
+            points_3d = []
             point_id_map = {}
             point_counter = 0
             
-            for keyframe_id, keyframe_observations in observations.items():
-                for feature_id, (map_point, keypoint) in keyframe_observations.items():
-                    point_3d = map_point.get_position()
-                    
-                    # Check if we've seen this point before
-                    if map_point not in point_id_map:
-                        point_id_map[map_point] = point_counter
-                        points_3d.append(point_3d)
-                        point_counter += 1
-                    
-                    observations_list.append({
-                        'keyframe_idx': keyframe_ids.index(keyframe_id),
-                        'point_idx': point_id_map[map_point],
-                        'observation': keypoint.pt
-                    })
+            # Extract camera matrix from first frame (assuming same for all frames)
+            K = np.array([[718.856, 0, 607.1928], [0, 718.856, 185.2157], [0, 0, 1]], dtype=np.float64)
+            rospy.loginfo(f"Camera matrix: {K}")
             
-            if len(observations_list) < 10:
-                return
+            # Create feature correspondences between consecutive frames
+            rospy.loginfo(f"Step 2: Processing {len(valid_frames)} frames for feature matching...")
+            for i in range(len(valid_frames) - 1):
+                rospy.loginfo(f"  Processing frame pair {i} -> {i+1}")
+                frame1_data = valid_frames[i]
+                frame2_data = valid_frames[i + 1]
+                
+                rospy.loginfo(f"    Frame {i}: ID={frame1_data['frame_id']}, descriptors shape={frame1_data['descriptors'].shape if frame1_data['descriptors'] is not None else 'None'}")
+                rospy.loginfo(f"    Frame {i+1}: ID={frame2_data['frame_id']}, descriptors shape={frame2_data['descriptors'].shape if frame2_data['descriptors'] is not None else 'None'}")
+                
+                # Match features between consecutive frames
+                rospy.loginfo(f"    Matching features between frames...")
+                matches, good_matches = match_features(
+                    frame1_data['descriptors'], 
+                    frame2_data['descriptors'], 
+                    self.detector_type
+                )
+                
+                rospy.loginfo(f"    Found {len(good_matches)} good matches out of {len(matches)} total matches")
+                
+                if len(good_matches) < 50:  # Need sufficient matches
+                    rospy.loginfo(f"    Insufficient matches ({len(good_matches)} < 50), skipping this pair")
+                    continue
+                
+                # Extract matched points
+                rospy.loginfo(f"    Extracting matched points...")
+                pts1, pts2 = get_matched_points(frame1_data['keypoints'], frame2_data['keypoints'], good_matches)
+                rospy.loginfo(f"    Extracted {len(pts1)} matched point pairs")
+                
+                # Triangulate 3D points
+                pose1 = frame1_data['pose']
+                pose2 = frame2_data['pose']
+                
+                rospy.loginfo(f"    Triangulating 3D points...")
+                # Triangulate points
+                points_3d_batch = self.triangulate_points(pts1, pts2, pose1, pose2, K)
+                rospy.loginfo(f"    Triangulated {len(points_3d_batch)} 3D points")
+                
+                # Add valid 3D points and observations
+                rospy.loginfo(f"    Adding valid 3D points and observations...")
+                valid_points_added = 0
+                for j, (match, point_3d) in enumerate(zip(good_matches, points_3d_batch)):
+                    if point_3d is not None and np.linalg.norm(point_3d) > 0.1 and np.linalg.norm(point_3d) < 1000.0:
+                        # Check if we've seen this point before
+                        point_key = (frame1_data['frame_id'], match.queryIdx)
+                        if point_key not in point_id_map:
+                            point_id_map[point_key] = point_counter
+                            points_3d.append(point_3d)
+                            point_counter += 1
+                        
+                        # Add observations for both frames
+                        observations_list.append({
+                            'frame_idx': i,
+                            'point_idx': point_id_map[point_key],
+                            'observation': pts1[j][0]  # 2D observation in frame1
+                        })
+                        observations_list.append({
+                            'frame_idx': i + 1,
+                            'point_idx': point_id_map[point_key],
+                            'observation': pts2[j][0]  # 2D observation in frame2
+                        })
+                        valid_points_added += 1
+                
+                rospy.loginfo(f"    Added {valid_points_added} valid observations for this frame pair")
+            
+            rospy.loginfo(f"Step 3: Bundle adjustment setup complete")
+            rospy.loginfo(f"  Total observations: {len(observations_list)}")
+            rospy.loginfo(f"  Total 3D points: {len(points_3d)}")
+            rospy.loginfo(f"  Total poses: {len(poses)}")
+            
+            if len(observations_list) < 20:  # Need sufficient observations
+                rospy.logwarn(f"Insufficient observations for bundle adjustment: {len(observations_list)} < 20")
+                return None
+            
+            # Skip if too many observations (can be slow)
+            if len(observations_list) > 2000:  # Limit observations for speed
+                rospy.logwarn(f"Too many observations ({len(observations_list)}), skipping bundle adjustment")
+                return None
             
             # Flatten optimization variables
-            poses_flat = np.array(poses).flatten()
-            points_3d_flat = np.array(points_3d).flatten()
+            rospy.loginfo("Step 4: Preparing optimization variables...")
+            poses_flat = np.array(poses, dtype=np.float64).flatten()
+            points_3d_flat = np.array(points_3d, dtype=np.float64).flatten()
+            
+            rospy.loginfo(f"  Poses flat shape: {poses_flat.shape}")
+            rospy.loginfo(f"  Points 3D flat shape: {points_3d_flat.shape}")
             
             # Optimization variables: [poses, points_3d]
             x0 = np.concatenate([poses_flat, points_3d_flat])
+            rospy.loginfo(f"  Combined optimization variables shape: {x0.shape}")
             
-            # Perform optimization
-            result = least_squares(
-                self.reprojection_error,
-                x0,
-                args=(observations_list, keyframes, len(poses), len(points_3d)),
-                method='lm',
-                max_nfev=100
-            )
+            # Check for invalid values
+            if np.any(np.isnan(x0)) or np.any(np.isinf(x0)):
+                rospy.logwarn("Invalid values in optimization variables (NaN or Inf)")
+                return None
             
+            rospy.loginfo(f"Bundle adjustment setup: {len(poses)} poses, {len(points_3d)} 3D points, {len(observations_list)} observations")
+            rospy.loginfo("Starting bundle adjustment optimization...")
+            rospy.loginfo(f"Bundle adjustment parameters: {len(valid_frames)} frames")
+            
+            # Log frame information for debugging
+            for i, frame_data in enumerate(valid_frames):
+                rospy.loginfo(f"Frame {i}: ID={frame_data['frame_id']}, pose shape={poses[i].shape}")
+            
+            # Perform optimization using scipy with threading timeout
+            rospy.loginfo("Step 5: Starting optimization with scipy.optimize.least_squares...")
+            from scipy.optimize import least_squares
+            import threading
+            import queue
+            
+            # Set up timeout for optimization using threading
+            result_queue = queue.Queue()
+            exception_queue = queue.Queue()
+            
+            def optimization_worker():
+                rospy.loginfo("  Optimization worker thread started")
+                try:
+                    rospy.loginfo("  Calling least_squares...")
+                    result = least_squares(
+                        self.reprojection_error_frames,
+                        x0,
+                        args=(observations_list, valid_frames, len(poses), len(points_3d)),
+                        method='lm',
+                        max_nfev=15,  # Very limited iterations for speed
+                        ftol=1e-1,    # Very relaxed function tolerance
+                        xtol=1e-1     # Very relaxed variable tolerance
+                    )
+                    rospy.loginfo("  least_squares completed successfully")
+                    result_queue.put(result)
+                except Exception as e:
+                    rospy.logerr(f"  Exception in optimization worker: {e}")
+                    exception_queue.put(e)
+            
+            # Start optimization in a separate thread
+            rospy.loginfo("  Starting optimization worker thread...")
+            worker_thread = threading.Thread(target=optimization_worker)
+            worker_thread.daemon = True
+            worker_thread.start()
+            
+            # Wait for completion with timeout
+            rospy.loginfo("  Waiting for optimization to complete (timeout: 2 seconds)...")
+            try:
+                worker_thread.join(timeout=2.0)  # 2 second timeout
+                if worker_thread.is_alive():
+                    rospy.logwarn("Bundle adjustment optimization timed out after 2 seconds")
+                    return None
+                
+                if not exception_queue.empty():
+                    raise exception_queue.get()
+                
+                rospy.loginfo("  Getting result from queue...")
+                result = result_queue.get_nowait()
+                rospy.loginfo("  Successfully retrieved optimization result")
+            except queue.Empty:
+                rospy.logwarn("Bundle adjustment optimization failed to return result")
+                return None
+            
+            rospy.loginfo("Step 6: Processing optimization results...")
             if result.success:
+                rospy.loginfo("  Optimization was successful")
                 # Update poses and 3D points
                 poses_flat_opt = result.x[:len(poses_flat)]
                 points_3d_flat_opt = result.x[len(poses_flat):]
                 
+                rospy.loginfo(f"  Optimized poses flat shape: {poses_flat_opt.shape}")
+                rospy.loginfo(f"  Optimized points 3D flat shape: {points_3d_flat_opt.shape}")
+                
                 # Reshape and update
                 poses_opt = poses_flat_opt.reshape(-1, 4, 4)
-                points_3d_opt = points_3d_flat_opt.reshape(-1, 3)
+                rospy.loginfo(f"  Reshaped poses to: {poses_opt.shape}")
                 
-                # Update map
-                keyframe_poses = {kf.frame_id: pose for kf, pose in zip(keyframes, poses_opt)}
-                self.map.update_keyframe_poses(keyframe_poses)
+                # Create optimized poses dictionary
+                optimized_poses = {frame_data['frame_id']: poses_opt[i] for i, frame_data in enumerate(valid_frames)}
+                rospy.loginfo(f"  Created optimized poses dictionary with {len(optimized_poses)} entries")
                 
-                # Update map point positions
-                point_positions = {i: pos for i, pos in enumerate(points_3d_opt)}
-                self.map.update_map_point_positions(point_positions)
+                rospy.loginfo(f"Bundle adjustment completed successfully with {len(observations_list)} observations")
+                rospy.loginfo("=== BUNDLE ADJUSTMENT COMPLETED SUCCESSFULLY ===")
                 
-                rospy.loginfo(f"Bundle adjustment completed with {len(observations_list)} observations")
+                # Return optimized poses for path update
+                return optimized_poses
+            else:
+                rospy.logwarn("Bundle adjustment optimization failed")
+                rospy.logwarn(f"  Optimization message: {result.message}")
+                return None
         
         except Exception as e:
             rospy.logerr(f"Error in bundle adjustment: {e}")
+            return None
         
         finally:
             self.ba_running = False
+            self._last_ba_time = time.time()
+            rospy.loginfo("Bundle adjustment completed (success or failure)")
     
-    def reprojection_error(self, x, observations, keyframes, num_poses, num_points):
+    def reprojection_error_frames(self, x, observations, valid_frames, num_poses, num_points):
         """
         Compute reprojection error for bundle adjustment.
         
         Args:
             x: Optimization variables [poses, points_3d]
             observations: List of observations
-            keyframes: List of KeyFrame objects
+            valid_frames: List of frame data dictionaries
             num_poses: Number of poses
             num_points: Number of 3D points
             
         Returns:
             Reprojection errors
         """
-        # Extract poses and 3D points
-        poses_flat = x[:num_poses * 16]
+        # Extract poses and 3D points from optimization variables
+        poses_flat = x[:num_poses * 16]  # 4x4 = 16 elements per pose
         points_3d_flat = x[num_poses * 16:]
         
         poses = poses_flat.reshape(num_poses, 4, 4)
         points_3d = points_3d_flat.reshape(num_points, 3)
         
+        # Extract camera matrix (hardcoded for now)
+        K = np.array([[718.856, 0, 607.1928], [0, 718.856, 185.2157], [0, 0, 1]], dtype=np.float64)
+        
         errors = []
         
+        # Add debug counter
+        processed_obs = 0
+        
         for obs in observations:
-            keyframe_idx = obs['keyframe_idx']
+            frame_idx = obs['frame_idx']
             point_idx = obs['point_idx']
             observation = obs['observation']
             
-            # Get pose and 3D point
-            pose = poses[keyframe_idx]
+            # Bounds checking
+            if frame_idx >= len(poses) or point_idx >= len(points_3d):
+                continue
+            
+            pose = poses[frame_idx]
             point_3d = points_3d[point_idx]
             
             # Project 3D point to 2D
-            point_cam = np.linalg.inv(pose) @ np.append(point_3d, 1.0)
-            point_cam = point_cam[:3] / point_cam[3]
+            point_homogeneous = np.append(point_3d, 1.0)
+            point_camera = pose @ point_homogeneous
+            point_camera = point_camera[:3] / point_camera[3]  # Perspective division
             
-            if point_cam[2] <= 0:  # Point behind camera
-                errors.extend([1000, 1000])  # Large error
+            if point_camera[2] <= 0:  # Point behind camera
+                errors.extend([1000.0, 1000.0])  # Large error
                 continue
             
-            # Get camera matrix from keyframe
-            keyframe = keyframes[keyframe_idx]
-            K = keyframe.camera_matrix
-            
-            # Project to image coordinates
-            point_2d = K @ point_cam
-            point_2d = point_2d[:2] / point_2d[2]
+            # Project to image plane
+            point_2d = K @ point_camera[:3]
+            point_2d = point_2d[:2] / point_2d[2]  # Perspective division
             
             # Compute reprojection error
-            error = point_2d - np.array(observation)
+            error = point_2d - observation
             errors.extend(error)
+            
+            processed_obs += 1
+            
+            # Print progress every 100 observations
+            if processed_obs % 100 == 0:
+                rospy.loginfo(f"    Reprojection error: processed {processed_obs}/{len(observations)} observations")
         
+        rospy.loginfo(f"    Reprojection error: completed {processed_obs} observations, returning {len(errors)} errors")
         return np.array(errors)
+    
+    def update_path_with_optimized_poses(self, optimized_poses):
+        """
+        Update the path history with optimized poses from bundle adjustment.
+        
+        Args:
+            optimized_poses: Dictionary mapping keyframe_id to optimized pose
+        """
+        try:
+            # Update path history with optimized poses
+            updated_count = 0
+            
+            # Use the path_keyframe_mapping to find which path entries correspond to optimized keyframes
+            for path_index, keyframe_id in self.path_keyframe_mapping.items():
+                if keyframe_id in optimized_poses:
+                    if path_index < len(self.path_history):
+                        self.path_history[path_index] = optimized_poses[keyframe_id].copy()
+                        updated_count += 1
+                        rospy.loginfo(f"Updated path entry {path_index} (keyframe {keyframe_id}) with optimized pose")
+            
+            if updated_count > 0:
+                rospy.loginfo(f"Updated {updated_count} poses in path history with bundle adjustment results")
+                
+                # Publish updated path
+                if len(self.path_history) > 0:
+                    # Create a dummy header for path publishing
+                    from std_msgs.msg import Header
+                    header = Header()
+                    header.stamp = rospy.Time.now()
+                    header.frame_id = "world"
+                    
+                    # Publish the updated path
+                    self.publish_path(self.path_history[-1], header)
+        
+        except Exception as e:
+            rospy.logerr(f"Error updating path with optimized poses: {e}")
     
     def publish_pose(self, pose_matrix, header):
         """
@@ -1601,7 +1934,12 @@ class SLAMSystem:
             header: ROS header
         """
         # Add current pose to path history
+        path_index = len(self.path_history)
         self.path_history.append(pose_matrix.copy())
+        
+        # Track which keyframe this pose corresponds to (if it's a keyframe)
+        if hasattr(self, 'current_frame_id'):
+            self.path_keyframe_mapping[path_index] = self.current_frame_id
         
         # Create Path message
         path_msg = Path()
