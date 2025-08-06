@@ -22,6 +22,7 @@ from vo.estimators.pose_estimator import (
 from vo.geometry.map import Map
 from vo.geometry.keyframe import KeyFrame
 from vo.geometry.mappoint import MapPoint
+from vo.geometry.frame import Frame
 
 class SLAMSystem:
     """
@@ -94,6 +95,9 @@ class SLAMSystem:
         # Sliding window for bundle adjustment (last 10 frames)
         self.frame_window = []  # List of (frame_id, pose, keypoints, descriptors) tuples
         self.max_frame_window = 10  # Maximum number of frames in sliding window
+        
+        # Frame storage for bundle adjustment
+        self.frames = {}  # Dictionary of {frame_id: Frame} objects
         
         # Keypoint tracking for debug visualization
         self._current_keypoints = []
@@ -245,6 +249,21 @@ class SLAMSystem:
                 
                 # Add frame to sliding window for bundle adjustment
                 self.add_frame_to_window(self.current_frame_id, pose, keypoints, descriptors)
+                
+                # Run bundle adjustment on the frame window after adding new frame
+                if len(self.frame_window) >= 5:  # Only run BA if we have enough frames
+                    rospy.loginfo(f"Running bundle adjustment on {len(self.frame_window)} frames after adding frame {self.current_frame_id}")
+                    try:
+                        optimized_poses = self.perform_bundle_adjustment_on_frames(self.frame_window)
+                        if optimized_poses:
+                            rospy.loginfo("Bundle adjustment completed successfully, updating path")
+                            self.update_path_with_optimized_poses(optimized_poses)
+                        else:
+                            rospy.loginfo("Bundle adjustment returned no results")
+                    except Exception as e:
+                        rospy.logerr(f"Error during bundle adjustment: {e}")
+                else:
+                    rospy.loginfo(f"Frame window too small ({len(self.frame_window)} < 5), skipping bundle adjustment")
             else:
                 rospy.logwarn(f"Invalid pose shape from track_frame: {pose.shape if pose is not None else 'None'}")
                 return False, None
@@ -315,7 +334,10 @@ class SLAMSystem:
         
         # Keep only the last max_frame_window frames
         if len(self.frame_window) > self.max_frame_window:
-            self.frame_window.pop(0)  # Remove oldest frame
+            removed_frame = self.frame_window.pop(0)  # Remove oldest frame
+            rospy.loginfo(f"Removed frame {removed_frame['frame_id']} from window, added frame {frame_id}")
+        else:
+            rospy.loginfo(f"Added frame {frame_id} to window (size: {len(self.frame_window)})")
     
     def get_current_keypoints(self):
         """
@@ -486,6 +508,53 @@ class SLAMSystem:
         rospy.loginfo(f"Publishing global pose: [{global_pose[0,3]:.2f}, {global_pose[1,3]:.2f}, {global_pose[2,3]:.2f}]")
         self.publish_pose(global_pose, header)
         self.publish_path(global_pose, header)
+        
+        # Create Frame object and store inlier observations
+        rospy.loginfo("Creating Frame object and storing inlier observations...")
+        current_frame = Frame(
+            frame_id=self.current_frame_id,
+            timestamp=header.stamp.to_sec(),
+            pose=global_pose,
+            keypoints=keypoints,
+            descriptors=descriptors,
+            camera_matrix=K
+        )
+        
+        # Store inlier observations from pose recovery
+        # We need to map the final inlier matches back to map points
+        ref_keypoints = self.reference_keyframe.get_keypoints()
+        ref_map_points = self.reference_keyframe.get_map_points()
+        
+        inlier_observations_added = 0
+        for match in final_inlier_matches:
+            ref_feature_id = match.queryIdx
+            curr_feature_id = match.trainIdx
+            
+            # Get the map point from reference keyframe
+            map_point = ref_map_points.get(ref_feature_id)
+            if map_point is not None:
+                # Get the 2D observation in current frame
+                curr_keypoint = keypoints[curr_feature_id]
+                observation_2d = np.array([curr_keypoint.pt[0], curr_keypoint.pt[1]])
+                
+                # Add observation to current frame
+                current_frame.add_inlier_observation(curr_feature_id, map_point, observation_2d)
+                
+                # Add frame observation to map point
+                map_point.add_frame_observation(self.current_frame_id, curr_feature_id)
+                
+                inlier_observations_added += 1
+        
+        rospy.loginfo(f"Added {inlier_observations_added} inlier observations to Frame {self.current_frame_id}")
+        
+        # Store frame for bundle adjustment
+        self.frames[self.current_frame_id] = current_frame
+        
+        # Clean up old frames to prevent memory issues (keep last 20 frames)
+        if len(self.frames) > 20:
+            oldest_frame_id = min(self.frames.keys())
+            del self.frames[oldest_frame_id]
+            rospy.loginfo(f"Cleaned up old frame {oldest_frame_id}, keeping {len(self.frames)} frames")
         
         # Publish success debug information
         debug_msg = f"Frame {self.current_frame_id}: Tracking SUCCESS! Global Pose: [{global_pose[0,3]:.2f}, {global_pose[1,3]:.2f}, {global_pose[2,3]:.2f}], State: {self.tracking_state}"
@@ -1426,6 +1495,11 @@ class SLAMSystem:
                         # Clear frame window
                         self.frame_window = []
                         
+                        # Clear frames
+                        self.frames = {}
+                        
+
+                        
                         # Clear previous frame data for fresh initialization
                         if hasattr(self, '_reference_frame'):
                             delattr(self, '_reference_frame')
@@ -1459,6 +1533,11 @@ class SLAMSystem:
                     # Clear frame window
                     self.frame_window = []
                     
+                    # Clear frames
+                    self.frames = {}
+                    
+
+                    
                     # Try to create a simple keyframe without map operations
                     rospy.loginfo("Creating simple keyframe for reinitialization...")
                     keyframe = KeyFrame(
@@ -1480,6 +1559,8 @@ class SLAMSystem:
                 self.path_history = []
                 self.path_keyframe_mapping = {}
                 self.frame_window = []
+                
+
             finally:
                 # Resume mapping thread
                 self.reinitializing = False
@@ -1520,32 +1601,9 @@ class SLAMSystem:
                 
                 rospy.loginfo(f"  Frame window size: {len(self.frame_window)}")
                 
-                # Get last 10 frames for bundle adjustment
-                if len(self.frame_window) >= 2:
-                    rospy.loginfo(f"  ✅ Frame window has {len(self.frame_window)} frames, proceeding with BA")
-                    rospy.loginfo(f"Performing bundle adjustment on {len(self.frame_window)} frames")
-                    
-                    try:
-                        rospy.loginfo("  🔄 About to call perform_bundle_adjustment_on_frames...")
-                        # Perform bundle adjustment on frame window
-                        optimized_poses = self.perform_bundle_adjustment_on_frames(self.frame_window)
-                        rospy.loginfo("  ✅ perform_bundle_adjustment_on_frames completed")
-                        
-                        # Update path with optimized poses
-                        if optimized_poses:
-                            rospy.loginfo("  🔄 Updating path with optimized poses...")
-                            self.update_path_with_optimized_poses(optimized_poses)
-                            rospy.loginfo("  ✅ Path updated successfully")
-                        else:
-                            rospy.loginfo("  ⚠️  No optimized poses returned from BA")
-                    except Exception as e:
-                        rospy.logerr(f"Bundle adjustment failed: {e}")
-                        rospy.logerr(f"Exception type: {type(e).__name__}")
-                        import traceback
-                        rospy.logerr(f"Traceback: {traceback.format_exc()}")
-                        # Continue without bundle adjustment
-                else:
-                    rospy.loginfo("  ⏭️  Frame window too small, skipping BA")
+                # Bundle adjustment is now run synchronously after each frame is processed
+                # This mapping loop now only handles map point culling and other maintenance tasks
+                rospy.loginfo("  🔄 Mapping loop iteration - bundle adjustment now runs synchronously after frame processing")
                 
                 rospy.loginfo("  🔄 About to cull map points...")
                 map_points_before = len(self.map.get_map_points())
@@ -1554,9 +1612,9 @@ class SLAMSystem:
                 map_points_after = len(self.map.get_map_points())
                 rospy.loginfo(f"  ✅ Map points culled: {map_points_before} -> {map_points_after} (removed {map_points_before - map_points_after})")
                 
-                rospy.loginfo("  😴 Sleeping for 2 seconds...")
-                # Sleep for bundle adjustment (0.5 Hz - every 2 seconds)
-                time.sleep(2.0)
+                rospy.loginfo("  😴 Sleeping for 5 seconds...")
+                # Sleep for maintenance tasks (0.2 Hz - every 5 seconds)
+                time.sleep(5.0)
                 rospy.loginfo("  ✅ Woke up from sleep")
                 
                 # Add a timeout check to prevent getting stuck
@@ -1578,7 +1636,8 @@ class SLAMSystem:
     
     def perform_bundle_adjustment_on_frames(self, frame_window):
         """
-        Perform bundle adjustment on the given frame window.
+        Perform bundle adjustment on the given frame window using existing Frame objects
+        and their inlier observations instead of redoing feature matching.
         
         Args:
             frame_window: List of frame data dictionaries
@@ -1592,14 +1651,15 @@ class SLAMSystem:
             rospy.loginfo("  ⏭️  BA already running, returning None")
             return None
         
-        # Check if enough time has passed since last bundle adjustment
-        current_time = time.time()
-        # if hasattr(self, '_last_ba_time') and current_time - self._last_ba_time < 5.0:  # Reduced to 5 seconds
-        #     rospy.loginfo("  ⏭️  Not enough time since last BA, returning None")
-        #     return None  # Skip if less than 5 seconds since last BA
+        # Bundle adjustment now runs synchronously after each frame, so we don't need time-based checks
+        # The frame window will always be different since a new frame was just added
         
         rospy.loginfo("  ✅ Setting ba_running = True")
         self.ba_running = True
+        
+        # Reset reprojection call counter for this bundle adjustment
+        self._reprojection_call_count = 0
+        self._last_error_norm = None
         
         try:
             # Create observations from frame window for full bundle adjustment
@@ -1639,85 +1699,95 @@ class SLAMSystem:
             
             rospy.loginfo("=== STARTING FULL BUNDLE ADJUSTMENT ===")
             
-            # Create observations from feature correspondences between frames
-            rospy.loginfo("Step 1: Creating observations from feature correspondences...")
+            # Step 1: Collect observations from existing Frame objects
+            rospy.loginfo("Step 1: Collecting observations from existing Frame objects...")
             observations_list = []
             points_3d = []
             point_id_map = {}
             point_counter = 0
             
+            # Track which map points are visible in which frames
+            map_point_visibility = {}  # Maps map_point to list of (frame_idx, observation) tuples
+            
             # Extract camera matrix from first frame (assuming same for all frames)
             K = np.array([[718.856, 0, 607.1928], [0, 718.856, 185.2157], [0, 0, 1]], dtype=np.float64)
             rospy.loginfo(f"Camera matrix: {K}")
             
-            # Create feature correspondences between consecutive frames
-            rospy.loginfo(f"Step 2: Processing {len(valid_frames)} frames for feature matching...")
-            for i in range(len(valid_frames) - 1):
-                rospy.loginfo(f"  Processing frame pair {i} -> {i+1}")
-                frame1_data = valid_frames[i]
-                frame2_data = valid_frames[i + 1]
+            # Step 2: Process each frame and collect its inlier observations
+            rospy.loginfo(f"Step 2: Processing {len(valid_frames)} frames for inlier observations...")
+            for i, frame_data in enumerate(valid_frames):
+                frame_id = frame_data['frame_id']
+                rospy.loginfo(f"  Processing frame {i}: ID={frame_id}")
                 
-                rospy.loginfo(f"    Frame {i}: ID={frame1_data['frame_id']}, descriptors shape={frame1_data['descriptors'].shape if frame1_data['descriptors'] is not None else 'None'}")
-                rospy.loginfo(f"    Frame {i+1}: ID={frame2_data['frame_id']}, descriptors shape={frame2_data['descriptors'].shape if frame2_data['descriptors'] is not None else 'None'}")
-                
-                # Match features between consecutive frames
-                rospy.loginfo(f"    Matching features between frames...")
-                matches, good_matches = match_features(
-                    frame1_data['descriptors'], 
-                    frame2_data['descriptors'], 
-                    self.detector_type
-                )
-                
-                rospy.loginfo(f"    Found {len(good_matches)} good matches out of {len(matches)} total matches")
-                
-                if len(good_matches) < 50:  # Need sufficient matches
-                    rospy.loginfo(f"    Insufficient matches ({len(good_matches)} < 50), skipping this pair")
+                # Get the Frame object for this frame
+                if frame_id not in self.frames:
+                    rospy.logwarn(f"    Frame {frame_id} not found in self.frames, skipping")
                     continue
                 
-                # Extract matched points
-                rospy.loginfo(f"    Extracting matched points...")
-                pts1, pts2 = get_matched_points(frame1_data['keypoints'], frame2_data['keypoints'], good_matches)
-                rospy.loginfo(f"    Extracted {len(pts1)} matched point pairs")
+                frame_obj = self.frames[frame_id]
+                inlier_observations = frame_obj.get_inlier_observations()
+                rospy.loginfo(f"    Frame {frame_id} has {len(inlier_observations)} inlier observations")
                 
-                # Triangulate 3D points
-                pose1 = frame1_data['pose']
-                pose2 = frame2_data['pose']
-                
-                rospy.loginfo(f"    Triangulating 3D points...")
-                # Triangulate points
-                points_3d_batch = self.triangulate_points(pts1, pts2, pose1, pose2, K)
-                rospy.loginfo(f"    Triangulated {len(points_3d_batch)} 3D points")
-                
-                # Add valid 3D points and observations
-                rospy.loginfo(f"    Adding valid 3D points and observations...")
-                valid_points_added = 0
-                for j, (match, point_3d) in enumerate(zip(good_matches, points_3d_batch)):
-                    if point_3d is not None and np.linalg.norm(point_3d) > 0.1 and np.linalg.norm(point_3d) < 1000.0:
-                        # Check if we've seen this point before
-                        point_key = (frame1_data['frame_id'], match.queryIdx)
-                        if point_key not in point_id_map:
-                            point_id_map[point_key] = point_counter
-                            points_3d.append(point_3d)
-                            point_counter += 1
-                        
-                        # Add observations for both frames
-                        observations_list.append({
-                            'frame_idx': i,
-                            'point_idx': point_id_map[point_key],
-                            'observation': pts1[j][0]  # 2D observation in frame1
-                        })
-                        observations_list.append({
-                            'frame_idx': i + 1,
-                            'point_idx': point_id_map[point_key],
-                            'observation': pts2[j][0]  # 2D observation in frame2
-                        })
-                        valid_points_added += 1
-                
-                rospy.loginfo(f"    Added {valid_points_added} valid observations for this frame pair")
+                # Process each inlier observation
+                for feature_id, (map_point, observation_2d) in inlier_observations.items():
+                    # Get the 3D position of the map point
+                    point_3d = map_point.get_position()
+                    
+                    # Use map point object as key for tracking visibility
+                    if map_point not in map_point_visibility:
+                        map_point_visibility[map_point] = []
+                        point_id_map[map_point] = point_counter
+                        points_3d.append(point_3d)
+                        point_counter += 1
+                    
+                    # Add observation to visibility tracking
+                    map_point_visibility[map_point].append((i, observation_2d))
             
-            rospy.loginfo(f"Step 3: Bundle adjustment setup complete")
+            # Step 3: Filter map points to only include those visible in 3+ frames
+            rospy.loginfo("Step 3: Filtering map points to only include those visible in 3+ frames...")
+            filtered_points_3d = []
+            filtered_point_id_map = {}
+            filtered_point_counter = 0
+            points_with_3plus_visibility = 0
+            
+            for map_point, visibility_list in map_point_visibility.items():
+                # Count unique frames where this map point is visible
+                unique_frames = set(frame_idx for frame_idx, _ in visibility_list)
+                
+                if len(unique_frames) >= 3:  # Only include points visible in 3+ frames
+                    # Get the original point index
+                    original_point_idx = point_id_map[map_point]
+                    
+                    # Add to filtered lists
+                    filtered_points_3d.append(points_3d[original_point_idx])
+                    filtered_point_id_map[map_point] = filtered_point_counter
+                    filtered_point_counter += 1
+                    points_with_3plus_visibility += 1
+                    
+                    # Add all observations for this map point
+                    for frame_idx, observation in visibility_list:
+                        observations_list.append({
+                            'frame_idx': frame_idx,
+                            'point_idx': filtered_point_id_map[map_point],
+                            'observation': observation
+                        })
+            
+            # Update points_3d to use filtered version
+            points_3d = filtered_points_3d
+            point_id_map = filtered_point_id_map
+            point_counter = filtered_point_counter
+            
+            rospy.loginfo(f"  Filtered to {points_with_3plus_visibility} map points visible in 3+ frames")
+            rospy.loginfo(f"  Total observations after filtering: {len(observations_list)}")
+            
+            # Check if we have enough points with 3+ frame visibility
+            if points_with_3plus_visibility < 10:
+                rospy.logwarn(f"Insufficient map points with 3+ frame visibility: {points_with_3plus_visibility} < 10")
+                return None
+            
+            rospy.loginfo(f"Step 4: Bundle adjustment setup complete")
             rospy.loginfo(f"  Total observations: {len(observations_list)}")
-            rospy.loginfo(f"  Total 3D points: {len(points_3d)}")
+            rospy.loginfo(f"  Total 3D points: {len(points_3d)} (all visible in 3+ frames)")
             rospy.loginfo(f"  Total poses: {len(poses)}")
             
             if len(observations_list) < 20:  # Need sufficient observations
@@ -1735,7 +1805,7 @@ class SLAMSystem:
                 return None
             
             # Flatten optimization variables
-            rospy.loginfo("Step 4: Preparing optimization variables...")
+            rospy.loginfo("Step 5: Preparing optimization variables...")
             poses_flat = np.array(poses, dtype=np.float64).flatten()
             points_3d_flat = np.array(points_3d, dtype=np.float64).flatten()
             
@@ -1751,7 +1821,7 @@ class SLAMSystem:
                 rospy.logwarn("Invalid values in optimization variables (NaN or Inf)")
                 return None
             
-            rospy.loginfo(f"Bundle adjustment setup: {len(poses)} poses, {len(points_3d)} 3D points, {len(observations_list)} observations")
+            rospy.loginfo(f"Bundle adjustment setup: {len(poses)} poses, {len(points_3d)} 3D points (filtered to 3+ frame visibility), {len(observations_list)} observations")
             rospy.loginfo("Starting bundle adjustment optimization...")
             rospy.loginfo(f"Bundle adjustment parameters: {len(valid_frames)} frames")
             
@@ -1760,7 +1830,7 @@ class SLAMSystem:
                 rospy.loginfo(f"Frame {i}: ID={frame_data['frame_id']}, pose shape={poses[i].shape}")
             
             # Perform optimization using scipy with threading timeout
-            rospy.loginfo("Step 5: Starting optimization with scipy.optimize.least_squares...")
+            rospy.loginfo("Step 6: Starting optimization with scipy.optimize.least_squares...")
             from scipy.optimize import least_squares
             import threading
             import queue
@@ -1773,11 +1843,12 @@ class SLAMSystem:
                 rospy.loginfo("  Optimization worker thread started")
                 try:
                     rospy.loginfo("  Calling least_squares...")
+                    
                     result = least_squares(
                         self.reprojection_error_frames,
                         x0,
                         args=(observations_list, valid_frames, len(poses), len(points_3d)),
-                        method='lm',
+                        method='lm',  # Levenberg-Marquardt
                         max_nfev=15,  # Very limited iterations for speed
                         ftol=1e-1,    # Very relaxed function tolerance
                         xtol=1e-1     # Very relaxed variable tolerance
@@ -1812,7 +1883,7 @@ class SLAMSystem:
                 rospy.logwarn("Bundle adjustment optimization failed to return result")
                 return None
             
-            rospy.loginfo("Step 6: Processing optimization results...")
+            rospy.loginfo("Step 7: Processing optimization results...")
             if result.success:
                 rospy.loginfo("  Optimization was successful")
                 # Update poses and 3D points
@@ -1830,7 +1901,15 @@ class SLAMSystem:
                 optimized_poses = {frame_data['frame_id']: poses_opt[i] for i, frame_data in enumerate(valid_frames)}
                 rospy.loginfo(f"  Created optimized poses dictionary with {len(optimized_poses)} entries")
                 
+                # Compute final reprojection error for summary
+                final_errors = self.reprojection_error_frames(result.x, observations_list, valid_frames, len(poses), len(points_3d))
+                mean_error = np.mean(np.abs(final_errors))
+                max_error = np.max(np.abs(final_errors))
+                
                 rospy.loginfo(f"Bundle adjustment completed successfully with {len(observations_list)} observations")
+                rospy.loginfo(f"  Summary: {len(points_3d)} 3D points (all visible in 3+ frames) across {len(poses)} poses")
+                rospy.loginfo(f"  Optimization iterations: {result.nfev} function evaluations")
+                rospy.loginfo(f"  Final reprojection error: mean={mean_error:.3f}, max={max_error:.3f}")
                 rospy.loginfo("=== BUNDLE ADJUSTMENT COMPLETED SUCCESSFULLY ===")
                 
                 # Return optimized poses for path update
@@ -1846,7 +1925,6 @@ class SLAMSystem:
         
         finally:
             self.ba_running = False
-            self._last_ba_time = time.time()
             rospy.loginfo("Bundle adjustment completed (success or failure)")
     
     def reprojection_error_frames(self, x, observations, valid_frames, num_poses, num_points):
@@ -1863,6 +1941,24 @@ class SLAMSystem:
         Returns:
             Reprojection errors
         """
+        # Track function call count for debugging
+        if not hasattr(self, '_reprojection_call_count'):
+            self._reprojection_call_count = 0
+        self._reprojection_call_count += 1
+        
+        # Track if parameters are changing
+        if not hasattr(self, '_last_x'):
+            self._last_x = None
+        if self._last_x is not None and self._last_x.shape == x.shape:
+            x_diff = np.linalg.norm(x - self._last_x)
+            if x_diff < 1e-10:  # Very small difference
+                rospy.logwarn(f"    WARNING: Parameters nearly identical (diff={x_diff:.2e}) on call #{self._reprojection_call_count}")
+            elif x_diff < 1e-6:  # Small difference
+                rospy.loginfo(f"    Small parameter change (diff={x_diff:.2e}) on call #{self._reprojection_call_count}")
+        elif self._last_x is not None and self._last_x.shape != x.shape:
+            rospy.loginfo(f"    Parameter shape changed from {self._last_x.shape} to {x.shape} on call #{self._reprojection_call_count}")
+        self._last_x = x.copy()
+        
         # Extract poses and 3D points from optimization variables
         poses_flat = x[:num_poses * 16]  # 4x4 = 16 elements per pose
         points_3d_flat = x[num_poses * 16:]
@@ -1913,7 +2009,20 @@ class SLAMSystem:
             # if processed_obs % 100 == 0:
             #     rospy.loginfo(f"    Reprojection error: processed {processed_obs}/{len(observations)} observations")
         
-        rospy.loginfo(f"    Reprojection error: completed {processed_obs} observations, returning {len(errors)} errors")
+        # Log with call count and parameter info for debugging
+        x_norm = np.linalg.norm(x)
+        error_norm = np.linalg.norm(errors)
+        rospy.loginfo(f"    Reprojection error: call #{self._reprojection_call_count}, completed {processed_obs} observations, returning {len(errors)} errors, ||x||={x_norm:.3f}, ||errors||={error_norm:.3f}")
+        
+        # Track error changes
+        if not hasattr(self, '_last_error_norm'):
+            self._last_error_norm = None
+        if self._last_error_norm is not None:
+            error_change = abs(error_norm - self._last_error_norm)
+            if error_change < 1e-6:
+                rospy.logwarn(f"    WARNING: Error norm nearly unchanged (change={error_change:.2e}) on call #{self._reprojection_call_count}")
+        self._last_error_norm = error_norm
+        
         return np.array(errors)
     
     def update_path_with_optimized_poses(self, optimized_poses):

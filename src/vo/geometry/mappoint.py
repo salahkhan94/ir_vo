@@ -20,8 +20,9 @@ class MapPoint:
         self.position_3d = position_3d.copy()  # 3D position in world coordinates
         self.normal = None  # Normal vector (will be computed later)
         
-        # Observations: {keyframe_id: feature_id}
+        # Observations: {keyframe_id: feature_id} and {frame_id: feature_id}
         self.observations = {first_keyframe_id: first_feature_id}
+        self.frame_observations = {}  # {frame_id: feature_id} for regular frames
         
         # Quality metrics
         self.observations_count = 1
@@ -47,7 +48,7 @@ class MapPoint:
     
     def add_observation(self, keyframe_id, feature_id):
         """
-        Add a new observation of this map point.
+        Add a new observation of this map point from a keyframe.
         
         Args:
             keyframe_id: ID of the keyframe observing this point
@@ -58,9 +59,22 @@ class MapPoint:
                 self.observations[keyframe_id] = feature_id
                 self.observations_count += 1
     
+    def add_frame_observation(self, frame_id, feature_id):
+        """
+        Add a new observation of this map point from a regular frame.
+        
+        Args:
+            frame_id: ID of the frame observing this point
+            feature_id: Feature ID in the frame
+        """
+        with self.lock:
+            if frame_id not in self.frame_observations:
+                self.frame_observations[frame_id] = feature_id
+                self.observations_count += 1
+    
     def remove_observation(self, keyframe_id):
         """
-        Remove an observation of this map point.
+        Remove an observation of this map point from a keyframe.
         
         Args:
             keyframe_id: ID of the keyframe to remove
@@ -71,15 +85,50 @@ class MapPoint:
                 self.observations_count -= 1
                 self.bad_observations_count += 1
     
+    def remove_frame_observation(self, frame_id):
+        """
+        Remove an observation of this map point from a frame.
+        
+        Args:
+            frame_id: ID of the frame to remove
+        """
+        with self.lock:
+            if frame_id in self.frame_observations:
+                del self.frame_observations[frame_id]
+                self.observations_count -= 1
+                self.bad_observations_count += 1
+    
     def get_observations(self):
         """
-        Get all observations of this map point.
+        Get all observations of this map point from keyframes.
         
         Returns:
             Dictionary of {keyframe_id: feature_id}
         """
         with self.lock:
             return self.observations.copy()
+    
+    def get_frame_observations(self):
+        """
+        Get all observations of this map point from regular frames.
+        
+        Returns:
+            Dictionary of {frame_id: feature_id}
+        """
+        with self.lock:
+            return self.frame_observations.copy()
+    
+    def get_all_observations(self):
+        """
+        Get all observations of this map point from both keyframes and frames.
+        
+        Returns:
+            Dictionary of {id: feature_id} where id can be keyframe_id or frame_id
+        """
+        with self.lock:
+            all_obs = self.observations.copy()
+            all_obs.update(self.frame_observations)
+            return all_obs
     
     def get_observations_count(self):
         """
@@ -90,6 +139,16 @@ class MapPoint:
         """
         with self.lock:
             return self.observations_count
+    
+    def get_unique_observers_count(self):
+        """
+        Get the number of unique frames/keyframes observing this map point.
+        
+        Returns:
+            Number of unique observers (keyframes + frames)
+        """
+        with self.lock:
+            return len(self.observations) + len(self.frame_observations)
     
     def is_observed_by_keyframe(self, keyframe_id):
         """
@@ -104,6 +163,19 @@ class MapPoint:
         with self.lock:
             return keyframe_id in self.observations
     
+    def is_observed_by_frame(self, frame_id):
+        """
+        Check if this map point is observed by a specific frame.
+        
+        Args:
+            frame_id: ID of the frame to check
+            
+        Returns:
+            True if observed, False otherwise
+        """
+        with self.lock:
+            return frame_id in self.frame_observations
+    
     def get_feature_id_in_keyframe(self, keyframe_id):
         """
         Get the feature ID of this map point in a specific keyframe.
@@ -116,6 +188,19 @@ class MapPoint:
         """
         with self.lock:
             return self.observations.get(keyframe_id, None)
+    
+    def get_feature_id_in_frame(self, frame_id):
+        """
+        Get the feature ID of this map point in a specific frame.
+        
+        Args:
+            frame_id: ID of the frame
+            
+        Returns:
+            Feature ID if observed, None otherwise
+        """
+        with self.lock:
+            return self.frame_observations.get(frame_id, None)
     
     def set_bad(self):
         """Mark this map point as bad."""
