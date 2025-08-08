@@ -2011,9 +2011,9 @@ class SLAMSystem:
                     rospy.loginfo(f"  Calling least_squares with method: {method}")
                     
                     # Debug checks before least_squares call
-                    rospy.loginfo(f"  DEBUG: Before least_squares - poses type: {type(poses)}, value: {poses}")
-                    rospy.loginfo(f"  DEBUG: Before least_squares - points_3d type: {type(points_3d)}, value: {points_3d}")
+                    # rospy.loginfo(f"  DEBUG: Before least_squares - poses type: {type(poses)}, value: {poses}")
                     
+                    # rospy.loginfo(f"  DEBUG: Before least_squares - points_3d type: {type(points_3d)}, value: {points_3d}")
                     if poses is None:
                         raise ValueError("poses is None before least_squares call")
                     if points_3d is None:
